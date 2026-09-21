@@ -37,6 +37,18 @@ async function requireAdmin(req: Request) {
   return profile?.role === "admin" ? admin : null;
 }
 
+async function userEmails(admin: ReturnType<typeof createClient>): Promise<Map<string, string>> {
+  const emails = new Map<string, string>();
+  let page = 1;
+  while (true) {
+    const { data, error } = await admin.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw error;
+    for (const user of data.users) emails.set(user.id, user.email ?? "—");
+    if (data.users.length < 1000) return emails;
+    page++;
+  }
+}
+
 Deno.serve(async (req: Request) => {
   const preflight = handleCorsPreflight(req);
   if (preflight) return preflight;
@@ -46,14 +58,89 @@ Deno.serve(async (req: Request) => {
   if (!admin) return jsonResponse({ error: "Administrator rights are required" }, { status: 403 });
 
   try {
-    const { action, checkId } = await req.json();
+    const { action, checkId, kind, queryText = "", category = "", trap, page = 0, pageSize = 50 } = await req.json();
     if (action === "list") {
-      const { data, error } = await admin
+      const [{ data, error }, emails] = await Promise.all([
+        admin
         .from("checks")
         .select("id, user_id, original_filename, status, total_rows, stats, error_message, result_storage_path, created_at, expires_at")
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: false }),
+        userEmails(admin),
+      ]);
       if (error) throw error;
-      return jsonResponse({ checks: data ?? [] });
+      return jsonResponse({ checks: (data ?? []).map((check) => ({ ...check, user_email: emails.get(check.user_id) ?? "Удалённый пользователь" })) });
+    }
+
+    if (action === "summary") {
+      const [checksResult, doneResult, processingResult, pendingResult, errorResult, suppressionResult, trapResult, retryResult, domainsResult, auditResult] = await Promise.all([
+        admin.from("checks").select("id", { count: "exact", head: true }),
+        admin.from("checks").select("id", { count: "exact", head: true }).eq("status", "done"),
+        admin.from("checks").select("id", { count: "exact", head: true }).eq("status", "processing"),
+        admin.from("checks").select("id", { count: "exact", head: true }).eq("status", "pending"),
+        admin.from("checks").select("id", { count: "exact", head: true }).eq("status", "error"),
+        admin.from("suppression_entries").select("id", { count: "exact", head: true }),
+        admin.from("suppression_entries").select("id", { count: "exact", head: true }).eq("is_trap", true),
+        admin.from("suppression_entries").select("id", { count: "exact", head: true }).ilike("action", "%retry%"),
+        admin.from("dead_domains").select("domain", { count: "exact", head: true }),
+        admin.from("admin_audit_log").select("id", { count: "exact", head: true }),
+      ]);
+      for (const result of [checksResult, doneResult, processingResult, pendingResult, errorResult, suppressionResult, trapResult, retryResult, domainsResult, auditResult]) {
+        if (result.error) throw result.error;
+      }
+      return jsonResponse({
+        checks: {
+          total: checksResult.count ?? 0,
+          done: doneResult.count ?? 0,
+          processing: (processingResult.count ?? 0) + (pendingResult.count ?? 0),
+          error: errorResult.count ?? 0,
+        },
+        blocklists: {
+          suppression: suppressionResult.count ?? 0,
+          traps: trapResult.count ?? 0,
+          retry: retryResult.count ?? 0,
+          deadDomains: domainsResult.count ?? 0,
+        },
+        imports: auditResult.count ?? 0,
+      });
+    }
+
+    if (action === "blocklist") {
+      const safeQueryText = String(queryText).trim();
+      const safeCategory = String(category).trim();
+      const safeTrap = trap === true ? "true" : trap === false ? "false" : "";
+      const safePage = Math.max(Number(page) || 0, 0);
+      const safePageSize = Math.min(Math.max(Number(pageSize) || 50, 1), 100);
+
+      if (kind === "suppression") {
+        let query = admin.from("suppression_entries").select("email_hash, domain, category, action, is_trap, last_seen, bounce_count", { count: "exact" });
+        if (safeQueryText) query = query.ilike("domain", `%${safeQueryText}%`);
+        if (safeCategory) query = query.eq("category", safeCategory);
+        if (safeTrap === "true") query = query.eq("is_trap", true);
+        if (safeTrap === "false") query = query.eq("is_trap", false);
+        const { data, error, count } = await query.order("last_seen", { ascending: false }).range(safePage * safePageSize, safePage * safePageSize + safePageSize - 1);
+        if (error) throw error;
+        return jsonResponse({ rows: data ?? [], total: count ?? 0 });
+      }
+
+      if (kind === "dead-domains") {
+        let query = admin.from("dead_domains").select("domain, reason, last_confirmed_at, confirm_count", { count: "exact" });
+        if (safeQueryText) query = query.ilike("domain", `%${safeQueryText}%`);
+        const { data, error, count } = await query.order("last_confirmed_at", { ascending: false }).range(safePage * safePageSize, safePage * safePageSize + safePageSize - 1);
+        if (error) throw error;
+        return jsonResponse({ rows: data ?? [], total: count ?? 0 });
+      }
+      return jsonResponse({ error: "Unsupported blocklist" }, { status: 400 });
+    }
+
+    if (action === "audit") {
+      const { data, error } = await admin
+        .from("admin_audit_log")
+        .select("id, admin_id, action, details, created_at")
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (error) throw error;
+      const emails = await userEmails(admin);
+      return jsonResponse({ entries: (data ?? []).map((entry) => ({ ...entry, admin_email: emails.get(entry.admin_id ?? "") ?? "Удалённый пользователь" })) });
     }
 
     if (action === "signed-url" && typeof checkId === "string") {

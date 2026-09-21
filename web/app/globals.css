@@ -32,7 +32,7 @@ body {
   margin-bottom: 16px;
 }
 
-input, button {
+input, select, button {
   font-size: 15px;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -44,6 +44,11 @@ input {
   color: var(--text);
   width: 100%;
   margin-bottom: 10px;
+}
+
+select {
+  background: var(--bg);
+  color: var(--text);
 }
 
 button {
@@ -98,3 +103,29 @@ a { color: var(--accent); }
 .help-container pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-size: 13px; }
 .help-container code { background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; font-size: 0.9em; }
 .help-container pre code { border: none; padding: 0; }
+
+.admin-container { max-width: 1200px; }
+.admin-header, .section-title, .button-row, .filter-row, .pagination { display: flex; align-items: center; gap: 8px; }
+.admin-header, .section-title { justify-content: space-between; }
+.admin-header h1, .section-title h3 { margin-bottom: 4px; }
+.admin-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0 16px; }
+.tab-active { background: var(--accent); }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.metric { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.metric span { display: block; color: var(--muted); font-size: 13px; min-height: 32px; }
+.metric b { font-size: 24px; }
+.filter-row { align-items: stretch; flex-wrap: wrap; margin: 16px 0; }
+.filter-row input { width: auto; flex: 1 1 180px; margin: 0; }
+.filter-row select { min-width: 150px; }
+.pagination { justify-content: flex-end; margin-top: 16px; }
+.table-wrap { overflow-x: auto; }
+.details-row td { background: rgba(15, 23, 42, 0.55); }
+.stats-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.stats-list span { border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; font-size: 12px; }
+.import-result { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+
+@media (max-width: 640px) {
+  .admin-header, .section-title { align-items: flex-start; flex-direction: column; }
+  .button-row { flex-wrap: wrap; }
+  .container { padding: 20px 12px; }
+}
