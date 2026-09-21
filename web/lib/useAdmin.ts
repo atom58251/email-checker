@@ -18,8 +18,8 @@ export function useAdmin() {
       .select("role")
       .eq("id", user.id)
       .single()
-      .then(({ data }) => {
-        if (data?.role !== "admin") {
+      .then(({ data, error }) => {
+        if (error || data?.role !== "admin") {
           router.push("/");
         } else {
           setIsAdmin(true);

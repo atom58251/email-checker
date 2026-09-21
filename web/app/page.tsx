@@ -5,6 +5,7 @@ export const dynamic = "force-dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { useUser } from "@/lib/useUser";
+import { useRole } from "@/lib/useRole";
 import { runCheck, buildXlsxBlob, type ProgressStage } from "@/lib/processFile";
 import { DELETE_STATUSES, REVIEW_STATUSES } from "@/lib/emailUtils";
 
@@ -30,6 +31,7 @@ const STAGE_LABELS: Record<ProgressStage, string> = {
 
 export default function HomePage() {
   const { user, loading: userLoading } = useUser();
+  const { role } = useRole();
   const [checks, setChecks] = useState<CheckRow[]>([]);
   const [column, setColumn] = useState("email");
   const [processing, setProcessing] = useState(false);
@@ -38,7 +40,11 @@ export default function HomePage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadChecks = useCallback(async () => {
-    const { data } = await supabase.from("checks").select("*").order("created_at", { ascending: false });
+    const { data, error: loadError } = await supabase.from("checks").select("*").order("created_at", { ascending: false });
+    if (loadError) {
+      setError(`Не удалось загрузить историю проверок: ${loadError.message}`);
+      return;
+    }
     setChecks((data as CheckRow[]) ?? []);
   }, []);
 
@@ -56,13 +62,14 @@ export default function HomePage() {
     const checkId = crypto.randomUUID();
     try {
       // сразу создаём запись, чтобы она появилась в истории со статусом "обрабатывается"
-      await supabase.from("checks").insert({
+      const { error: insertError } = await supabase.from("checks").insert({
         id: checkId,
         user_id: user.id,
         original_filename: file.name,
         status: "processing",
       });
-      loadChecks();
+      if (insertError) throw new Error(`Не удалось создать проверку: ${insertError.message}`);
+      await loadChecks();
 
       // вся тяжёлая работа — в браузере (см. lib/processFile.ts), Edge
       // Functions вызываются только для лёгкой сверки хэшей и MX батчами,
@@ -76,7 +83,7 @@ export default function HomePage() {
       const { error: upErr } = await supabase.storage.from("results").upload(resultPath, blob, { upsert: true });
       if (upErr) throw upErr;
 
-      await supabase
+      const { error: updateError } = await supabase
         .from("checks")
         .update({
           status: "done",
@@ -85,14 +92,19 @@ export default function HomePage() {
           result_storage_path: resultPath,
         })
         .eq("id", checkId);
+      if (updateError) throw new Error(`Файл результата сохранён, но статус не обновлён: ${updateError.message}`);
 
       if (fileInputRef.current) fileInputRef.current.value = "";
-      loadChecks();
+      await loadChecks();
     } catch (err: any) {
       const message = err.message ?? String(err);
       setError(message);
-      await supabase.from("checks").update({ status: "error", error_message: message }).eq("id", checkId);
-      loadChecks();
+      const { error: statusError } = await supabase
+        .from("checks")
+        .update({ status: "error", error_message: message })
+        .eq("id", checkId);
+      if (statusError) setError(`${message}. Не удалось сохранить ошибку: ${statusError.message}`);
+      await loadChecks();
     } finally {
       setProcessing(false);
       setProgress(null);
@@ -102,7 +114,10 @@ export default function HomePage() {
   async function handleDownload(check: CheckRow) {
     if (!check.result_storage_path) return;
     const { data, error } = await supabase.storage.from("results").createSignedUrl(check.result_storage_path, 60);
-    if (error || !data) return;
+    if (error || !data) {
+      setError(`Не удалось подготовить скачивание: ${error?.message ?? "файл не найден"}`);
+      return;
+    }
     window.open(data.signedUrl, "_blank");
   }
 
@@ -118,6 +133,7 @@ export default function HomePage() {
         <h1>Проверка email-списков</h1>
         <div style={{ display: "flex", gap: 8 }}>
           <a href="/help"><button className="secondary">Справка</button></a>
+          {role === "admin" && <a href="/admin"><button className="secondary">Админ-панель</button></a>}
           <button className="secondary" onClick={handleSignOut}>Выйти</button>
         </div>
       </div>

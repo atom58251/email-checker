@@ -2,9 +2,19 @@
 
 export const dynamic = "force-dynamic";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import { useAdmin } from "@/lib/useAdmin";
+
+type AdminCheck = {
+  id: string;
+  user_id: string;
+  original_filename: string | null;
+  status: string;
+  total_rows: number | null;
+  result_storage_path: string | null;
+  created_at: string;
+};
 
 export default function AdminPage() {
   const { isAdmin, loading } = useAdmin();
@@ -12,7 +22,48 @@ export default function AdminPage() {
   const [uploading, setUploading] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  const [checks, setChecks] = useState<AdminCheck[]>([]);
+  const [loadingChecks, setLoadingChecks] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  async function callAdminResults<T>(body: unknown): Promise<T> {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const token = sessionData.session?.access_token;
+    if (!token) throw new Error("Сессия истекла. Войдите снова.");
+    const response = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/admin-results`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error ?? `Ошибка сервера (${response.status})`);
+    return data as T;
+  }
+
+  async function loadAllChecks() {
+    setLoadingChecks(true);
+    try {
+      const data = await callAdminResults<{ checks: AdminCheck[] }>({ action: "list" });
+      setChecks(data.checks);
+    } catch (err: any) {
+      setError(err.message ?? String(err));
+    } finally {
+      setLoadingChecks(false);
+    }
+  }
+
+  async function downloadResult(checkId: string) {
+    try {
+      const data = await callAdminResults<{ signedUrl: string }>({ action: "signed-url", checkId });
+      window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+    } catch (err: any) {
+      setError(err.message ?? String(err));
+    }
+  }
+
+  useEffect(() => {
+    if (isAdmin) loadAllChecks();
+  }, [isAdmin]);
 
   async function handleImport() {
     const file = fileInputRef.current?.files?.[0];
@@ -61,7 +112,10 @@ export default function AdminPage() {
     <div className="container">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <h1>Админ-панель</h1>
-        <a href="/help"><button className="secondary">Справка</button></a>
+        <div style={{ display: "flex", gap: 8 }}>
+          <a href="/"><button className="secondary">Проверка списков</button></a>
+          <a href="/help"><button className="secondary">Справка</button></a>
+        </div>
       </div>
       <div className="card">
         <h3>Импорт bounce-отчёта в suppression-list</h3>
@@ -120,6 +174,36 @@ export default function AdminPage() {
                 )}
               </div>
             )}
+          </div>
+        )}
+      </div>
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Результаты всех проверок</h3>
+            <p className="muted">Скачать можно только готовый результат; ссылка действует 60 секунд.</p>
+          </div>
+          <button className="secondary" onClick={loadAllChecks} disabled={loadingChecks}>
+            {loadingChecks ? "Обновление..." : "Обновить"}
+          </button>
+        </div>
+        {checks.length === 0 && !loadingChecks && <p className="muted">Проверок пока нет.</p>}
+        {checks.length > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th>Файл</th><th>Пользователь</th><th>Статус</th><th>Строк</th><th /></tr></thead>
+              <tbody>
+                {checks.map((check) => (
+                  <tr key={check.id}>
+                    <td>{check.original_filename ?? "—"}</td>
+                    <td className="muted">{check.user_id}</td>
+                    <td>{check.status}</td>
+                    <td>{check.total_rows ?? "—"}</td>
+                    <td>{check.status === "done" && check.result_storage_path && <button className="secondary" onClick={() => downloadResult(check.id)}>Скачать</button>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
