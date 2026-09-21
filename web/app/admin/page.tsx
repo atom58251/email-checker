@@ -61,6 +61,31 @@ export default function AdminPage() {
     }
   }
 
+  async function downloadBlocklist(action: "suppression-csv" | "dead-domains-csv", filename: string) {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData.session?.access_token;
+      if (!token) throw new Error("Сессия истекла. Войдите снова.");
+      const response = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/admin-results`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ action }),
+      });
+      if (!response.ok) {
+        const body = await response.json();
+        throw new Error(body.error ?? `Ошибка сервера (${response.status})`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setError(err.message ?? String(err));
+    }
+  }
+
   useEffect(() => {
     if (isAdmin) loadAllChecks();
   }, [isAdmin]);
@@ -176,6 +201,14 @@ export default function AdminPage() {
             )}
           </div>
         )}
+      </div>
+      <div className="card">
+        <h3>Блоклисты для анализа</h3>
+        <p className="muted">Suppression-list содержит SHA-256 хэши email и причины блокировки; открытые email в нём не хранятся.</p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="secondary" onClick={() => downloadBlocklist("suppression-csv", "suppression-list.csv")}>Скачать suppression-list</button>
+          <button className="secondary" onClick={() => downloadBlocklist("dead-domains-csv", "dead-domains.csv")}>Скачать блоклист доменов</button>
+        </div>
       </div>
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>

@@ -1,10 +1,28 @@
 // Admin-only access to result metadata and short-lived result links.  Keeping
 // this behind an Edge Function avoids weakening the owner-only RLS policies.
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
-import { handleCorsPreflight, jsonResponse } from "../_shared/cors.ts";
+import { corsHeaders, handleCorsPreflight, jsonResponse } from "../_shared/cors.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+function csvCell(value: unknown): string {
+  let text = value == null ? "" : String(value);
+  // Prevent spreadsheet applications from treating imported bounce text as a formula.
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function csvResponse(filename: string, headers: string[], rows: unknown[][]): Response {
+  const csv = [headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
+  return new Response(`\uFEFF${csv}`, {
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+    },
+  });
+}
 
 async function requireAdmin(req: Request) {
   const authHeader = req.headers.get("Authorization") ?? "";
@@ -52,6 +70,32 @@ Deno.serve(async (req: Request) => {
         .createSignedUrl(check.result_storage_path, 60);
       if (urlError || !data) throw urlError ?? new Error("Could not create a signed URL");
       return jsonResponse({ signedUrl: data.signedUrl });
+    }
+
+    if (action === "suppression-csv") {
+      const { data, error } = await admin
+        .from("suppression_entries")
+        .select("email_hash, domain, reason, category, action, is_trap, first_seen, last_seen, bounce_count, created_at")
+        .order("domain", { ascending: true });
+      if (error) throw error;
+      return csvResponse(
+        "suppression-list.csv",
+        ["email_hash", "domain", "reason", "category", "action", "is_trap", "first_seen", "last_seen", "bounce_count", "created_at"],
+        (data ?? []).map((row) => [row.email_hash, row.domain, row.reason, row.category, row.action, row.is_trap, row.first_seen, row.last_seen, row.bounce_count, row.created_at]),
+      );
+    }
+
+    if (action === "dead-domains-csv") {
+      const { data, error } = await admin
+        .from("dead_domains")
+        .select("domain, reason, first_confirmed_at, last_confirmed_at, confirm_count")
+        .order("domain", { ascending: true });
+      if (error) throw error;
+      return csvResponse(
+        "dead-domains.csv",
+        ["domain", "reason", "first_confirmed_at", "last_confirmed_at", "confirm_count"],
+        (data ?? []).map((row) => [row.domain, row.reason, row.first_confirmed_at, row.last_confirmed_at, row.confirm_count]),
+      );
     }
 
     return jsonResponse({ error: "Unsupported action" }, { status: 400 });
