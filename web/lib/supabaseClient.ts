@@ -12,7 +12,7 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 if (!supabaseUrl || !supabaseAnonKey) {
   throw new Error(
     "Не заданы NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY. " +
-      "Добавьте их в переменные окружения проекта на Vercel."
+      "Добавьте их в переменные окружения проекта на Netlify."
   );
 }
 

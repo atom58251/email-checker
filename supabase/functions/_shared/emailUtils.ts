@@ -180,6 +180,56 @@ export const REVIEW_STATUSES = new Set(["NO_MAIL_SUSPECTED", "DNS_INCONCLUSIVE",
 // =============================================================================
 export type CategoryBucket = "PERMANENT_BLOCK" | "TRAP" | "RETRY_LATER" | "SENDER_ISSUE";
 
+/**
+ * Приводит значение даты из bounce-отчёта к формату YYYY-MM-DD, который
+ * Postgres примет для last_seen (тип date). Разные провайдеры присылают
+ * дату по-разному (ISO, DD.MM.YYYY, unix-timestamp, Excel serial-число),
+ * а иногда колонка содержит вообще не дату (см. падение всего импорта
+ * из-за одной строки со значением "1434.1" — ::date не смог её разобрать
+ * и упал весь батч из 500 записей). Возвращает null, если распознать не
+ * удалось — вызывающий код в этом случае берёт текущую дату вместо того,
+ * чтобы ронять импорт целиком из-за одной строки.
+ */
+export function normalizeReportDate(raw: string): string | null {
+  const v = raw.trim();
+  if (!v) return null;
+
+  // ISO 8601: 2026-01-16 или 2026-01-16T14:34:01(.123)?(Z)?
+  const iso = /^(\d{4}-\d{2}-\d{2})/.exec(v);
+  if (iso && !isNaN(new Date(v).getTime())) return iso[1];
+
+  // DD.MM.YYYY / DD/MM/YYYY / DD-MM-YYYY, опционально с временем следом
+  const dmy = /^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})\b/.exec(v);
+  if (dmy) {
+    const day = Number(dmy[1]), month = Number(dmy[2]), year = Number(dmy[3]);
+    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  // Unix timestamp: 10 цифр (секунды) или 13 цифр (миллисекунды)
+  if (/^\d{10}$/.test(v)) {
+    const d = new Date(Number(v) * 1000);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  if (/^\d{13}$/.test(v)) {
+    const d = new Date(Number(v));
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+
+  // Excel serial date (целая часть — дни с 1899-12-30). Ограничиваем
+  // правдоподобным диапазоном (~2000–2100 гг.), чтобы не принять за дату
+  // случайное число из совсем другой колонки.
+  const num = Number(v);
+  if (!isNaN(num) && num >= 36526 && num <= 73050) {
+    const ms = Math.round((num - 25569) * 86400 * 1000);
+    const d = new Date(ms);
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+
+  return null;
+}
+
 const CATEGORY_RULES: Array<[string, CategoryBucket]> = [
   ["address does not exist", "PERMANENT_BLOCK"],
   ["invalid_mailbox", "PERMANENT_BLOCK"],

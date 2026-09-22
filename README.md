@@ -4,7 +4,7 @@
 получают результат (keep/delete), админ пополняет базу известных
 недействительных адресов (suppression-list) из bounce-отчётов.
 
-- **Фронтенд:** Next.js → Vercel (бесплатный тариф Hobby)
+- **Фронтенд:** Next.js → Netlify (бесплатный тариф Starter/Free)
 - **Backend + БД:** Supabase (Postgres + Auth + Storage + Edge Functions,
   бесплатный тариф Free)
 - **Проверки:** только офлайн — синтаксис, опечатки, disposable-домены,
@@ -16,7 +16,7 @@
 ## 1. Архитектура
 
 ```
-Пользователь → Vercel (Next.js) → БРАУЗЕР: разбор файла, офлайн-проверки,
+Пользователь → Netlify (Next.js) → БРАУЗЕР: разбор файла, офлайн-проверки,
                                             SHA-256 хэши (lib/processFile.ts)
                                   → Edge Function 'check-suppression'
                                        (батчами по 2000 хэшей → Postgres)
@@ -27,7 +27,7 @@
                                   → Storage bucket 'results' (сам пользователь)
                                   → скачивание через signed URL (60 сек)
 
-Админ → Vercel /admin → Storage 'uploads' → Edge Function 'import-bounces'
+Админ → Netlify /admin → Storage 'uploads' → Edge Function 'import-bounces'
                                              └─ email → SHA-256 хэш → suppression_entries
 ```
 
@@ -74,26 +74,43 @@
    ```sql
    update public.profiles set role = 'admin' where id = '<ваш user_id из auth.users>';
    ```
-8. (Опционально) Включите Cron Jobs в Dashboard → Database → Cron Jobs
-   для ежедневного вызова `purge-expired` — см. комментарий в конце
-   `supabase/migrations/0001_init.sql`.
+8. Включите Cron Jobs в Dashboard → Database → Cron Jobs для вызова
+   `purge-expired` **не реже раза в час** (не раз в сутки — при TTL
+   в 1 день редкий запуск даёт данным висеть в базе на сутки-двое
+   вместо суток). Пример SQL для Dashboard:
+   ```sql
+   select cron.schedule('purge-expired-checks', '0 * * * *',
+     $$ select public.purge_expired_checks(); select net.http_post(
+          url:='https://<project>.functions.supabase.co/purge-expired',
+          headers:='{"Authorization": "Bearer <service_role_key>"}'::jsonb); $$);
+   ```
 
 ---
 
-## 3. Деплой фронтенда на Vercel
+## 3. Деплой фронтенда на Netlify
 
-1. Залейте папку `web/` в свой GitHub-репозиторий (можно — весь проект,
-   Vercel сам найдёт `web/` как корень, если укажете Root Directory).
-2. На [vercel.com](https://vercel.com) → New Project → импортируйте репозиторий,
-   Root Directory = `web`.
-3. Добавьте переменные окружения (Project Settings → Environment Variables):
+1. Залейте проект в свой GitHub-репозиторий.
+2. На [netlify.com](https://netlify.com) → Add new site → Import an existing
+   project → выберите репозиторий.
+3. В настройках сборки (Site settings → Build & deploy → Base directory):
+   - **Base directory**: `web`
+   - **Build command**: `npm run build`
+   - **Publish directory**: Netlify сам подставит нужную для Next.js
+     (через встроенный `@netlify/plugin-nextjs` — он подключается
+     автоматически, когда Netlify видит Next.js проект, отдельный
+     `netlify.toml` для этого не обязателен).
+4. Добавьте переменные окружения (Site settings → Environment variables):
    - `NEXT_PUBLIC_SUPABASE_URL`
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 
    Оба значения — из Supabase Dashboard → Project Settings → API.
-   **Не добавляйте service_role key на Vercel** — фронтенду он не нужен
+   **Не добавляйте service_role key на Netlify** — фронтенду он не нужен
    и не должен быть доступен браузеру ни в каком виде.
-4. Deploy. Готово — Vercel даёт бесплатный домен `*.vercel.app`.
+5. Deploy. Готово — Netlify даёт бесплатный домен `*.netlify.app`.
+6. Если Netlify подключён к GitHub (Continuous Deployment включён по
+   умолчанию при импорте через Git) — каждый `git push` в основную ветку
+   автоматически запускает пересборку и деплой, вручную ничего жать не
+   нужно.
 
 ---
 
@@ -114,7 +131,7 @@ npm run dev
 жизненного цикла данных, как вы просили.
 
 ### 5.1 Сбор и передача (in transit)
-- Vercel и Supabase используют HTTPS/TLS по умолчанию везде — от браузера
+- Netlify и Supabase используют HTTPS/TLS по умолчанию везде — от браузера
   до Storage и Edge Functions. Отдельно настраивать не нужно.
 - Файл пользователя загружается напрямую в Supabase Storage из браузера
   (через authenticated-запрос с anon key + RLS), не проходя через
@@ -144,9 +161,11 @@ npm run dev
 - Загруженный пользователем файл удаляется из bucket `uploads` сразу
   после обработки — не хранится "просто на всякий случай".
 - И результаты, и метаданные проверки автоматически удаляются через
-  14 дней (`expires_at` в таблице `checks` + Edge Function
-  `purge-expired`, вызываемая по расписанию). Срок можно изменить в
-  миграции.
+  **1 день** (`expires_at` в таблице `checks` + Edge Function
+  `purge-expired`, вызываемая по расписанию не реже раза в час). Срок
+  можно изменить в миграции `0012_short_retention.sql`. Важно: это
+  жёсткое удаление — если пользователь не скачал результат в течение
+  суток, файл и запись о проверке пропадают безвозвратно.
 - Скачивание результата — через **временную signed URL (60 секунд)**,
   а не через постоянную публичную ссылку на файл.
 
@@ -161,7 +180,7 @@ npm run dev
   документ, а не код; нужен, если сервисом будут пользоваться третьи
   лица, особенно из ЕС (GDPR) — у вас как минимум работает 14-дневное
   хранение, это стоит явно прописать пользователю.
-- **Договор с Supabase/Vercel как с обработчиками данных** (Data
+- **Договор с Supabase/Netlify как с обработчиками данных** (Data
   Processing Agreement) — у обоих есть готовые DPA, доступные в аккаунте,
   подписываются в пару кликов, если это требуется по вашей юрисдикции.
 - **2FA для админского аккаунта** — Supabase Auth поддерживает, включите
@@ -220,8 +239,9 @@ web/
   запрос после паузы будет медленным, дальше нормально); 500 MB БД,
   1 GB Storage, 2 GB egress/мес — для текстовых email-списков этого
   надолго хватит.
-- **Vercel Hobby:** только для некоммерческого использования по их
-  условиям; серверные функции ограничены по времени выполнения (не
-  критично здесь — вся тяжёлая работа в Supabase Edge Functions).
+- **Netlify Free (Starter):** в отличие от Vercel Hobby, коммерческое
+  использование разрешено; лимиты — 100 GB bandwidth/мес, 300 минут
+  сборки/мес, 125k вызовов функций/мес (серверные функции здесь не
+  критичны — вся тяжёлая работа в Supabase Edge Functions).
 - Оба сервиса не гарантируют SLA на бесплатном тарифе — для чего-то
   критичного к аптайму стоит рассматривать платный план после теста.

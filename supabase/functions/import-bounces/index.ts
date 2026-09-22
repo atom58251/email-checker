@@ -12,7 +12,7 @@
 //     и возвращаются в ответе как unresolvedCount, без попытки угадать)
 // =============================================================================
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
-import { hashEmail, checkSyntax, EMAIL_IN_TEXT_RE, classifyCategory } from "../_shared/emailUtils.ts";
+import { hashEmail, checkSyntax, EMAIL_IN_TEXT_RE, classifyCategory, normalizeReportDate } from "../_shared/emailUtils.ts";
 import { parseUploadedFile } from "../_shared/parseFile.ts";
 import { handleCorsPreflight, jsonResponse } from "../_shared/cors.ts";
 
@@ -73,6 +73,7 @@ Deno.serve(async (req: Request) => {
     let resolvedFromText = 0;
     let unresolved = 0;
     let trapsFound = 0;
+    let dateFallbackCount = 0;
     const senderIssueCounts: Record<string, number> = {};
     const upserts: Array<{
       email_hash: string;
@@ -98,7 +99,9 @@ Deno.serve(async (req: Request) => {
       // Поэтому action всегда выводим из НАШЕЙ классификации категории —
       // она единый источник истины и для "хранить или нет", и для
       // "навсегда или временно".
-      const dateStr = String(row["sent_utc"] ?? row["added_utc"] ?? "").trim();
+      const dateRaw = String(row["sent_utc"] ?? row["added_utc"] ?? "").trim();
+      const dateNormalized = normalizeReportDate(dateRaw);
+      if (dateRaw && !dateNormalized) dateFallbackCount++;
       const text = String(row["smtp_response"] ?? row["last_response"] ?? "");
 
       const bucket = classifyCategory(category);
@@ -140,7 +143,7 @@ Deno.serve(async (req: Request) => {
           category,
           action,
           is_trap: isTrap,
-          last_seen: dateStr || new Date().toISOString(),
+          last_seen: dateNormalized ?? new Date().toISOString().slice(0, 10),
           added_by: adminUserId,
         });
       } else {
@@ -164,7 +167,7 @@ Deno.serve(async (req: Request) => {
       action: "import_bounces",
       details: {
         filename, resolvedFromColumn, resolvedFromText, unresolved,
-        total: rows.length, trapsFound, senderIssueCounts,
+        total: rows.length, trapsFound, senderIssueCounts, dateFallbackCount,
       },
     });
 
@@ -179,6 +182,7 @@ Deno.serve(async (req: Request) => {
       totalAddedOrUpdated: upserts.length,
       trapsFound,
       senderIssueCounts,
+      dateFallbackCount,
     });
   } catch (e) {
     return jsonResponse({ error: String(e?.message ?? e) }, { status: 500 });
