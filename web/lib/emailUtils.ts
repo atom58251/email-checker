@@ -154,6 +154,7 @@ export function offlinePrecheck(emailRaw: unknown, disposableDomains: Set<string
 export const DELETE_STATUSES = new Set([
   "INVALID_SYNTAX", "DELETE_SUPPRESSED", "DELETE_DISPOSABLE",
   "DELETE_DOMAIN_NOT_EXISTS", "TYPO_SUSPECTED", "EMPTY",
+  "DUPLICATE_IN_FILE",
 ]);
 
 // Статусы, которые НЕ удаляются автоматически, но требуют внимания:

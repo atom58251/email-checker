@@ -76,14 +76,54 @@ export async function runCheck(
     );
   }
 
+  // --- ФАЗА 0: ячейки с несколькими email через запятую/точку с запятой/
+  // пробел/перенос строки. Первый адрес остаётся в исходной ячейке,
+  // остальные добавляются как новые строки в конец списка (остальные
+  // колонки дублируются из исходной строки — метаданные общие для всех
+  // адресов, извлечённых из одной ячейки). Идём фиксированным диапазоном
+  // originalRowCount, а не rows.length, чтобы не зациклиться на только
+  // что добавленных строках.
+  const EMAIL_SPLIT_RE = /[,;\s]+/;
+  const originalRowCount = rows.length;
+  for (let i = 0; i < originalRowCount; i++) {
+    const raw = rows[i][resolvedColumn];
+    if (typeof raw !== "string") continue;
+    const parts = raw.split(EMAIL_SPLIT_RE).map((p) => p.trim()).filter(Boolean);
+    if (parts.length <= 1) continue;
+    rows[i] = { ...rows[i], [resolvedColumn]: parts[0] };
+    for (let j = 1; j < parts.length; j++) {
+      rows.push({ ...rows[i], [resolvedColumn]: parts[j] });
+    }
+  }
+
   // --- ФАЗА 1: офлайн-проверки (без сети, но с периодическими "вдохами"
   // для event loop, чтобы вкладка не казалась зависшей на 100k+ строк) ---
   type PendingRow = { rowIndex: number; emailNorm: string; domain: string };
   const pendingSuppression: PendingRow[] = [];
   const statusByRow = new Map<number, { status: string; comment: string; suggestedDomain?: string }>();
 
+  // Дубли считаются только внутри этого файла (после разбивки многоадресных
+  // ячеек выше) — по нормализованному (trim + lowercase) адресу. Первое
+  // вхождение проходит проверку как обычно, повторные сразу помечаются
+  // DUPLICATE_IN_FILE и не тратят сетевые батчи (suppression/MX).
+  const seenEmails = new Set<string>();
+
   for (let i = 0; i < rows.length; i++) {
     const email = rows[i][resolvedColumn];
+    const normalizedForDedup = typeof email === "string" ? email.trim().toLowerCase() : "";
+    if (normalizedForDedup && seenEmails.has(normalizedForDedup)) {
+      statusByRow.set(i, {
+        status: "DUPLICATE_IN_FILE",
+        comment: "дубликат — такой адрес уже встречался раньше в этом файле",
+      });
+      if (i % YIELD_EVERY === 0) {
+        onProgress("offline", i, rows.length);
+        await yieldToUI();
+      }
+      continue;
+    }
+    if (normalizedForDedup) seenEmails.add(normalizedForDedup);
+
     const r = offlinePrecheck(email, BUILTIN_DISPOSABLE_DOMAINS);
     if (r.status === "NEEDS_SUPPRESSION_CHECK") {
       pendingSuppression.push({ rowIndex: i, emailNorm: r.emailNorm, domain: r.domain });
