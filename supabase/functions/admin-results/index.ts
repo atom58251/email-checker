@@ -2,6 +2,7 @@
 // this behind an Edge Function avoids weakening the owner-only RLS policies.
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 import { corsHeaders, handleCorsPreflight, jsonResponse } from "../_shared/cors.ts";
+import { categoryToRussianLabel } from "../_shared/emailUtils.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -112,14 +113,15 @@ Deno.serve(async (req: Request) => {
       const safePageSize = Math.min(Math.max(Number(pageSize) || 50, 1), 100);
 
       if (kind === "suppression") {
-        let query = admin.from("suppression_entries").select("email_hash, domain, category, action, is_trap, last_seen, bounce_count", { count: "exact" });
+        let query = admin.from("suppression_entries").select("email_hash, domain, category, action, is_trap, sender_email, sender_domain, last_seen, bounce_count", { count: "exact" });
         if (safeQueryText) query = query.ilike("domain", `%${safeQueryText}%`);
         if (safeCategory) query = query.eq("category", safeCategory);
         if (safeTrap === "true") query = query.eq("is_trap", true);
         if (safeTrap === "false") query = query.eq("is_trap", false);
         const { data, error, count } = await query.order("last_seen", { ascending: false }).range(safePage * safePageSize, safePage * safePageSize + safePageSize - 1);
         if (error) throw error;
-        return jsonResponse({ rows: data ?? [], total: count ?? 0 });
+        const rows = (data ?? []).map((row) => ({ ...row, reason_ru: categoryToRussianLabel(row.category ?? "") }));
+        return jsonResponse({ rows, total: count ?? 0 });
       }
 
       if (kind === "dead-domains") {
@@ -162,13 +164,13 @@ Deno.serve(async (req: Request) => {
     if (action === "suppression-csv") {
       const { data, error } = await admin
         .from("suppression_entries")
-        .select("email_hash, domain, reason, category, action, is_trap, first_seen, last_seen, bounce_count, created_at")
+        .select("email_hash, domain, reason, category, action, is_trap, sender_email, sender_domain, first_seen, last_seen, bounce_count, created_at")
         .order("domain", { ascending: true });
       if (error) throw error;
       return csvResponse(
         "suppression-list.csv",
-        ["email_hash", "domain", "reason", "category", "action", "is_trap", "first_seen", "last_seen", "bounce_count", "created_at"],
-        (data ?? []).map((row) => [row.email_hash, row.domain, row.reason, row.category, row.action, row.is_trap, row.first_seen, row.last_seen, row.bounce_count, row.created_at]),
+        ["email_hash", "domain", "reason", "category", "Причина (рус.)", "action", "is_trap", "sender_email", "sender_domain", "first_seen", "last_seen", "bounce_count", "created_at"],
+        (data ?? []).map((row) => [row.email_hash, row.domain, row.reason, row.category, categoryToRussianLabel(row.category ?? ""), row.action, row.is_trap, row.sender_email, row.sender_domain, row.first_seen, row.last_seen, row.bounce_count, row.created_at]),
       );
     }
 

@@ -34,6 +34,7 @@ export default function HomePage() {
   const { role } = useRole();
   const [checks, setChecks] = useState<CheckRow[]>([]);
   const [column, setColumn] = useState("email");
+  const [senderDomain, setSenderDomain] = useState("");
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState<{ stage: ProgressStage; done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -76,7 +77,7 @@ export default function HomePage() {
       // чтобы не упираться в CPU time limit на больших файлах
       const { outputRows, stats } = await runCheck(file, column, (stage, done, total) => {
         setProgress({ stage, done, total });
-      });
+      }, senderDomain || undefined);
 
       const blob = buildXlsxBlob(outputRows);
       const resultPath = `${user.id}/${checkId}.xlsx`;
@@ -152,6 +153,13 @@ export default function HomePage() {
           value={column}
           onChange={(e) => setColumn(e.target.value)}
           placeholder="Название колонки с email (по умолчанию 'email')"
+          disabled={processing}
+        />
+        <input
+          type="text"
+          value={senderDomain}
+          onChange={(e) => setSenderDomain(e.target.value)}
+          placeholder="Для какого домена проверяем (например, course1.ru) — влияет на учёт отписок"
           disabled={processing}
         />
         <input type="file" ref={fileInputRef} accept=".xlsx,.xls,.csv" disabled={processing} />

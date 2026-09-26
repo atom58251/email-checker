@@ -37,7 +37,7 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Не авторизован" }, { status: 401 });
   }
 
-  const { hashes } = await req.json();
+  const { hashes, senderDomain } = await req.json();
   if (!Array.isArray(hashes) || hashes.length === 0) {
     return jsonResponse({ error: "hashes: непустой массив обязателен" }, { status: 400 });
   }
@@ -50,7 +50,16 @@ Deno.serve(async (req: Request) => {
     // RPC вместо .from().in() — параметры уходят в теле POST-запроса,
     // а не в URL, так что размер батча больше не ограничен длиной URL
     // (см. миграцию 0006_check_suppression_rpc.sql).
-    const { data, error } = await admin.rpc("check_suppression_hashes", { hashes });
+    // senderDomain: домен, ДЛЯ КОТОРОГО проверяем список (например, курс на
+    // course1.ru). Записи об отписке в suppression-list привязаны к
+    // конкретному домену отправителя (см. 0013) и заблокируют адрес только
+    // при совпадении домена — если senderDomain не передан, такие записи
+    // не учитываются вообще (глобальные bounce/spam-жалобы блокируют
+    // всегда, независимо от этого параметра).
+    const { data, error } = await admin.rpc("check_suppression_hashes", {
+      hashes,
+      p_sender_domain: senderDomain || "",
+    });
 
     if (error) {
       return jsonResponse({ error: `check_suppression_hashes: ${error.message}` }, { status: 500 });

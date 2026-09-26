@@ -1,0 +1,604 @@
+diff --git a/supabase/functions/_shared/emailUtils.ts b/supabase/functions/_shared/emailUtils.ts
+index 1e9a9b8..73fd8b0 100644
+--- a/supabase/functions/_shared/emailUtils.ts
++++ b/supabase/functions/_shared/emailUtils.ts
+@@ -178,7 +178,22 @@ export const REVIEW_STATUSES = new Set(["NO_MAIL_SUSPECTED", "DNS_INCONCLUSIVE",
+ // разрешить "смягчить" повторным импортом с другой категорией
+ // (см. is_trap и upsert_suppression_batch в 0004_trap_protection.sql).
+ // =============================================================================
+-export type CategoryBucket = "PERMANENT_BLOCK" | "TRAP" | "RETRY_LATER" | "SENDER_ISSUE";
++export type CategoryBucket =
++  | "PERMANENT_BLOCK"
++  | "TRAP"
++  | "RETRY_LATER"
++  | "SENDER_ISSUE"
++  | "COMPLAINT_UNSUBSCRIBE" // получатель сам отказался (отписка) или пожаловался
++                            // на спам (FBL) — адрес РАБОЧИЙ, это не bounce,
++                            // но результат тот же: больше не отправлять.
++                            // Храним отдельно от PERMANENT_BLOCK, чтобы не
++                            // путать "адрес мёртв" с "адрес жив, но просил
++                            // не писать" при разборе блоклиста позже.
++  | "IGNORE";               // не несёт информации о проблеме с адресом
++                             // (успешная доставка/открытие/клик, дубль
++                             // внутри той же рассылки, ещё не финальный
++                             // статус) — не пишем в suppression и не
++                             // засоряем сводку senderIssueCounts.
+ 
+ /**
+  * Приводит значение даты из bounce-отчёта к формату YYYY-MM-DD, который
+@@ -247,6 +262,54 @@ const CATEGORY_RULES: Array<[string, CategoryBucket]> = [
+   ["mail_server_unreachable", "SENDER_ISSUE"],
+   ["server_refuses_mail", "SENDER_ISSUE"],
+   ["gmail_throttling", "SENDER_ISSUE"],
++
++  // ===========================================================================
++  // Unisender Go — расширенные статусы писем (godocs.unisender.ru/email-statuses).
++  // Коды именно в таком виде приходят в колонке "Результат отправки" их
++  // выгрузки (см. обсуждение с пользователем в чате) — сравнение ниже по
++  // вхождению подстроки, поэтому регистр и небольшие вариации не критичны.
++  // ===========================================================================
++
++  // Несуществующие/погибшие адреса — реальный ответ сервера о недоставке.
++  ["err_user_unknown", "PERMANENT_BLOCK"],
++  ["err_user_inactive", "PERMANENT_BLOCK"],
++  ["err_mailbox_discarded", "PERMANENT_BLOCK"],
++  ["err_domain_inactive", "PERMANENT_BLOCK"],
++  // err_unreachable у Unisender формально "temp ~6 месяцев", но полгода
++  // достаточно долго, чтобы практичнее сразу считать адрес мёртвым, чем
++  // держать его в рассылках ещё столько времени.
++  ["err_unreachable", "PERMANENT_BLOCK"],
++
++  // Временные проблемы у получателя — адрес рабочий.
++  ["err_mailbox_full", "RETRY_LATER"], // дублирует "mailbox_full" выше, оставлено явно для читаемости
++  ["err_skip_letter", "RETRY_LATER"],
++
++  // Проблема на стороне ОТПРАВИТЕЛЯ (репутация/контент/конфигурация) —
++  // адрес получателя ни при чём, банить его нельзя.
++  ["err_spam_rejected", "SENDER_ISSUE"],
++  ["err_spam_skipped", "SENDER_ISSUE"],
++  ["err_spam_removed", "SENDER_ISSUE"],
++  ["err_blacklisted", "SENDER_ISSUE"], // это про ваш IP/домен в чёрных списках, не про адрес получателя
++  ["err_destination_misconfigured", "SENDER_ISSUE"],
++  ["err_delivery_failed", "SENDER_ISSUE"], // недостаточно детализировано, безопаснее не банить
++  ["err_lost", "SENDER_ISSUE"],
++  ["err_internal", "SENDER_ISSUE"],
++  ["err_too_large", "SENDER_ISSUE"],
++
++  // Получатель сам отказался/пожаловался — адрес рабочий, но писать нельзя.
++  ["ok_unsubscribed", "COMPLAINT_UNSUBSCRIBE"],
++  ["ok_fbl", "COMPLAINT_UNSUBSCRIBE"],
++  ["ok_spam_folder", "COMPLAINT_UNSUBSCRIBE"],
++
++  // Позитивные и технические статусы — ничего не говорят о проблеме адреса.
++  ["ok_sent", "IGNORE"],
++  ["ok_delivered", "IGNORE"],
++  ["ok_read", "IGNORE"],
++  ["ok_link_visited", "IGNORE"],
++  ["err_will_retry", "IGNORE"],      // ещё не финальный статус
++  ["skip_dup_unreachable", "IGNORE"],       // дубль внутри рассылки, событие уже учтено по первому вхождению
++  ["skip_dup_temp_unreachable", "IGNORE"],
++  ["skip_dup_mailbox_full", "IGNORE"],
+ ];
+ 
+ /**
+@@ -263,3 +326,61 @@ export function classifyCategory(category: string): CategoryBucket {
+   }
+   return "SENDER_ISSUE";
+ }
++
++// =============================================================================
++// Человекочитаемая причина на русском — для показа в UI блоклиста и в
++// CSV-выгрузке (по аналогии с тем, как Юнисендер показывает понятные
++// формулировки, а не только код статуса). Отдельно от CATEGORY_RULES, т.к.
++// это про читаемость для человека, а не про бакет для логики блокировки —
++// один код может звучать по-разному, но вести себя одинаково, поэтому
++// список ключей здесь такой же, а результат — просто текст, не bucket.
++// =============================================================================
++const CATEGORY_LABELS_RU: Array<[string, string]> = [
++  ["address does not exist", "Адрес не существует"],
++  ["invalid_mailbox", "Ящик не существует"],
++  ["invalid mailbox", "Ящик не существует"],
++  ["domain_has_no_mail_server", "У домена нет почтового сервера"],
++  ["broken mx record", "Битая MX-запись"],
++  ["yandex account blocked by yandex", "Аккаунт заблокирован Яндексом"],
++  ["disposable inbox service", "Одноразовый почтовый сервис"],
++  ["disposable_or_trap", "Одноразовый адрес или спам-ловушка"],
++  ["mailbox_full", "Ящик переполнен"],
++  ["mailbox full", "Ящик переполнен"],
++  ["mail_server_unreachable", "Сервер получателя недоступен (не вина адреса)"],
++  ["server_refuses_mail", "Сервер отклоняет почту (проблема отправителя)"],
++  ["gmail_throttling", "Ограничение скорости от Gmail (не вина адреса)"],
++
++  // Unisender Go
++  ["err_user_unknown", "Ящик не существует"],
++  ["err_user_inactive", "Ящик не используется получателем"],
++  ["err_mailbox_discarded", "Ящик удалён"],
++  ["err_domain_inactive", "Домен не принимает почту"],
++  ["err_unreachable", "Адрес долго недоступен (~6 месяцев)"],
++  ["err_mailbox_full", "Ящик переполнен"],
++  ["err_skip_letter", "Письмо временно не доставлено"],
++  ["err_spam_rejected", "Отклонено как спам (проблема отправителя)"],
++  ["err_spam_skipped", "Пропущено спам-фильтром (проблема отправителя)"],
++  ["err_spam_removed", "Удалено спам-фильтром после доставки (проблема отправителя)"],
++  ["err_blacklisted", "IP/домен отправителя в чёрном списке"],
++  ["err_destination_misconfigured", "Ошибка конфигурации сервера получателя"],
++  ["err_delivery_failed", "Доставка не удалась (причина не уточнена)"],
++  ["err_lost", "Письмо потеряно при отправке"],
++  ["err_internal", "Внутренняя ошибка отправителя"],
++  ["err_too_large", "Письмо слишком большое"],
++  ["ok_unsubscribed", "Получатель отписался"],
++  ["ok_fbl", "Жалоба на спам (Feedback Loop)"],
++  ["ok_spam_folder", "Попало в папку «Спам»"],
++];
++
++/**
++ * Возвращает читаемую причину на русском. Если категория не распознана —
++ * возвращаем её как есть (не теряем информацию, просто не переводим).
++ */
++export function categoryToRussianLabel(category: string): string {
++  const text = category.trim().toLowerCase();
++  if (!text) return "—";
++  for (const [key, label] of CATEGORY_LABELS_RU) {
++    if (text.includes(key)) return label;
++  }
++  return category;
++}
+diff --git a/supabase/functions/admin-results/index.ts b/supabase/functions/admin-results/index.ts
+index 299a9c7..0fe0fc8 100644
+--- a/supabase/functions/admin-results/index.ts
++++ b/supabase/functions/admin-results/index.ts
+@@ -2,6 +2,7 @@
+ // this behind an Edge Function avoids weakening the owner-only RLS policies.
+ import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+ import { corsHeaders, handleCorsPreflight, jsonResponse } from "../_shared/cors.ts";
++import { categoryToRussianLabel } from "../_shared/emailUtils.ts";
+ 
+ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+@@ -112,14 +113,15 @@ Deno.serve(async (req: Request) => {
+       const safePageSize = Math.min(Math.max(Number(pageSize) || 50, 1), 100);
+ 
+       if (kind === "suppression") {
+-        let query = admin.from("suppression_entries").select("email_hash, domain, category, action, is_trap, last_seen, bounce_count", { count: "exact" });
++        let query = admin.from("suppression_entries").select("email_hash, domain, category, action, is_trap, sender_email, sender_domain, last_seen, bounce_count", { count: "exact" });
+         if (safeQueryText) query = query.ilike("domain", `%${safeQueryText}%`);
+         if (safeCategory) query = query.eq("category", safeCategory);
+         if (safeTrap === "true") query = query.eq("is_trap", true);
+         if (safeTrap === "false") query = query.eq("is_trap", false);
+         const { data, error, count } = await query.order("last_seen", { ascending: false }).range(safePage * safePageSize, safePage * safePageSize + safePageSize - 1);
+         if (error) throw error;
+-        return jsonResponse({ rows: data ?? [], total: count ?? 0 });
++        const rows = (data ?? []).map((row) => ({ ...row, reason_ru: categoryToRussianLabel(row.category ?? "") }));
++        return jsonResponse({ rows, total: count ?? 0 });
+       }
+ 
+       if (kind === "dead-domains") {
+@@ -162,13 +164,13 @@ Deno.serve(async (req: Request) => {
+     if (action === "suppression-csv") {
+       const { data, error } = await admin
+         .from("suppression_entries")
+-        .select("email_hash, domain, reason, category, action, is_trap, first_seen, last_seen, bounce_count, created_at")
++        .select("email_hash, domain, reason, category, action, is_trap, sender_email, sender_domain, first_seen, last_seen, bounce_count, created_at")
+         .order("domain", { ascending: true });
+       if (error) throw error;
+       return csvResponse(
+         "suppression-list.csv",
+-        ["email_hash", "domain", "reason", "category", "action", "is_trap", "first_seen", "last_seen", "bounce_count", "created_at"],
+-        (data ?? []).map((row) => [row.email_hash, row.domain, row.reason, row.category, row.action, row.is_trap, row.first_seen, row.last_seen, row.bounce_count, row.created_at]),
++        ["email_hash", "domain", "reason", "category", "Причина (рус.)", "action", "is_trap", "sender_email", "sender_domain", "first_seen", "last_seen", "bounce_count", "created_at"],
++        (data ?? []).map((row) => [row.email_hash, row.domain, row.reason, row.category, categoryToRussianLabel(row.category ?? ""), row.action, row.is_trap, row.sender_email, row.sender_domain, row.first_seen, row.last_seen, row.bounce_count, row.created_at]),
+       );
+     }
+ 
+diff --git a/supabase/functions/check-suppression/index.ts b/supabase/functions/check-suppression/index.ts
+index 38b69b8..0b4768c 100644
+--- a/supabase/functions/check-suppression/index.ts
++++ b/supabase/functions/check-suppression/index.ts
+@@ -37,7 +37,7 @@ Deno.serve(async (req: Request) => {
+     return jsonResponse({ error: "Не авторизован" }, { status: 401 });
+   }
+ 
+-  const { hashes } = await req.json();
++  const { hashes, senderDomain } = await req.json();
+   if (!Array.isArray(hashes) || hashes.length === 0) {
+     return jsonResponse({ error: "hashes: непустой массив обязателен" }, { status: 400 });
+   }
+@@ -50,7 +50,16 @@ Deno.serve(async (req: Request) => {
+     // RPC вместо .from().in() — параметры уходят в теле POST-запроса,
+     // а не в URL, так что размер батча больше не ограничен длиной URL
+     // (см. миграцию 0006_check_suppression_rpc.sql).
+-    const { data, error } = await admin.rpc("check_suppression_hashes", { hashes });
++    // senderDomain: домен, ДЛЯ КОТОРОГО проверяем список (например, курс на
++    // course1.ru). Записи об отписке в suppression-list привязаны к
++    // конкретному домену отправителя (см. 0013) и заблокируют адрес только
++    // при совпадении домена — если senderDomain не передан, такие записи
++    // не учитываются вообще (глобальные bounce/spam-жалобы блокируют
++    // всегда, независимо от этого параметра).
++    const { data, error } = await admin.rpc("check_suppression_hashes", {
++      hashes,
++      p_sender_domain: senderDomain || "",
++    });
+ 
+     if (error) {
+       return jsonResponse({ error: `check_suppression_hashes: ${error.message}` }, { status: 500 });
+diff --git a/supabase/functions/import-bounces/index.ts b/supabase/functions/import-bounces/index.ts
+index 664728b..056dbbb 100644
+--- a/supabase/functions/import-bounces/index.ts
++++ b/supabase/functions/import-bounces/index.ts
+@@ -49,10 +49,18 @@ Deno.serve(async (req: Request) => {
+     return jsonResponse({ error: "Требуются права администратора" }, { status: 403 });
+   }
+ 
+-  const { storagePath, filename, emailColumn } = await req.json();
++  const { storagePath, filename, emailColumn, senderEmail } = await req.json();
+   if (!storagePath) {
+     return jsonResponse({ error: "storagePath обязателен" }, { status: 400 });
+   }
++  const senderEmailNorm = String(senderEmail ?? "").trim().toLowerCase();
++  if (!senderEmailNorm || !senderEmailNorm.includes("@")) {
++    return jsonResponse(
++      { error: "senderEmail обязателен — с какой почты/домена был этот отчёт (нужно для правильной привязки отписок к проекту)" },
++      { status: 400 }
++    );
++  }
++  const senderDomain = senderEmailNorm.split("@")[1];
+ 
+   try {
+     const { data: fileBlob, error: dlErr } = await admin.storage.from("uploads").download(storagePath);
+@@ -62,8 +70,12 @@ Deno.serve(async (req: Request) => {
+     const rows = parseUploadedFile(bytes, filename ?? "report.csv");
+ 
+     if (rows.length === 0) throw new Error("Файл пуст");
+-    if (!("category" in rows[0])) {
+-      throw new Error(`В отчёте нет колонки 'category'. Найдены: ${Object.keys(rows[0]).join(", ")}`);
++    const CATEGORY_COL_ALIASES = ["category", "Результат отправки"];
++    const foundCategoryCol = CATEGORY_COL_ALIASES.find((c) => c in rows[0]);
++    if (!foundCategoryCol) {
++      throw new Error(
++        `В отчёте нет колонки категории (ожидалась одна из: ${CATEGORY_COL_ALIASES.join(", ")}). Найдены: ${Object.keys(rows[0]).join(", ")}`
++      );
+     }
+ 
+     const candidates = [emailColumn, "email", "address", "recipient", "recipient_email"].filter(Boolean);
+@@ -74,6 +86,7 @@ Deno.serve(async (req: Request) => {
+     let unresolved = 0;
+     let trapsFound = 0;
+     let dateFallbackCount = 0;
++    let ignoredCount = 0;
+     const senderIssueCounts: Record<string, number> = {};
+     const upserts: Array<{
+       email_hash: string;
+@@ -82,12 +95,17 @@ Deno.serve(async (req: Request) => {
+       category: string;
+       action: string;
+       is_trap: boolean;
++      sender_email: string;
++      sender_domain: string;
+       last_seen: string;
+       added_by: string;
+     }> = [];
+ 
+     for (const row of rows) {
+-      const category = String(row["category"] ?? "").trim();
++      // "Результат отправки" — реальное название колонки в выгрузке Unisender
++      // Go (см. обсуждение в чате); foundCategoryCol определён выше по тому
++      // же списку алиасов, которым уже прошла валидация файла.
++      const category = String(row[foundCategoryCol] ?? "").trim();
+       // ВАЖНО: action НЕ берём дословно из файла. У разных источников разные
+       // слова для одного и того же смысла — у Postal action='RETRY in 2-4
+       // weeks' (содержит 'retry'), у Listmonk та же по сути ситуация
+@@ -99,13 +117,27 @@ Deno.serve(async (req: Request) => {
+       // Поэтому action всегда выводим из НАШЕЙ классификации категории —
+       // она единый источник истины и для "хранить или нет", и для
+       // "навсегда или временно".
+-      const dateRaw = String(row["sent_utc"] ?? row["added_utc"] ?? "").trim();
++      const dateRaw = String(row["sent_utc"] ?? row["added_utc"] ?? row["Время обновления"] ?? "").trim();
+       const dateNormalized = normalizeReportDate(dateRaw);
+       if (dateRaw && !dateNormalized) dateFallbackCount++;
+       const text = String(row["smtp_response"] ?? row["last_response"] ?? "");
+ 
+       const bucket = classifyCategory(category);
+-      const action = bucket === "RETRY_LATER" ? "RETRY in 2-4 weeks" : "DELETE from list";
++
++      // IGNORE: статус не говорит о проблеме с адресом вообще (успешная
++      // доставка/открытие/клик, дубль внутри той же рассылки Unisender,
++      // ещё не финальный статус) — пропускаем молча, даже не засоряя
++      // сводку senderIssueCounts (иначе на большой базе "ok_read: 50000"
++      // забьёт собой реально полезные предупреждения в сводке).
++      if (bucket === "IGNORE") {
++        ignoredCount++;
++        continue;
++      }
++
++      const action =
++        bucket === "RETRY_LATER" ? "RETRY in 2-4 weeks" :
++        bucket === "COMPLAINT_UNSUBSCRIBE" ? "DELETE — complaint/unsubscribe" :
++        "DELETE from list";
+ 
+       // SENDER_ISSUE: проблема отправителя (throttling, временная
+       // недоступность сервера, отказ по политике) — НЕ повод удалять
+@@ -136,6 +168,12 @@ Deno.serve(async (req: Request) => {
+         const domain = emailNorm.split("@")[1];
+         const isTrap = bucket === "TRAP";
+         if (isTrap) trapsFound++;
++        // Глобальная блокировка (bounce-факт про адрес, спам-жалоба) —
++        // sender_domain = '' (сентинел из 0013). Только отписка
++        // (COMPLAINT_UNSUBSCRIBE) привязывается к конкретному домену
++        // отправителя: у админа 10 проектов на разных доменах, и отписка
++        // от одного не должна блокировать рассылки с другого.
++        const entrySenderDomain = bucket === "COMPLAINT_UNSUBSCRIBE" ? senderDomain : "";
+         upserts.push({
+           email_hash: await hashEmail(emailNorm),
+           domain,
+@@ -143,6 +181,8 @@ Deno.serve(async (req: Request) => {
+           category,
+           action,
+           is_trap: isTrap,
++          sender_email: senderEmailNorm,
++          sender_domain: entrySenderDomain,
+           last_seen: dateNormalized ?? new Date().toISOString().slice(0, 10),
+           added_by: adminUserId,
+         });
+@@ -151,8 +191,11 @@ Deno.serve(async (req: Request) => {
+       }
+     }
+ 
+-    // upsert по email_hash: если запись уже есть — обновляем last_seen/bounce_count
+-    // через RPC (простой upsert с increment пишем как отдельный SQL-вызов)
++    // upsert по (email_hash, sender_domain): если запись уже есть — обновляем
++    // last_seen/bounce_count через RPC (см. 0013_sender_scoped_unsubscribe.sql —
++    // конфликт теперь по паре, а не только по email_hash, чтобы глобальная
++    // bounce-запись и запись об отписке от конкретного домена не затирали
++    // друг друга).
+     const CHUNK = 500;
+     for (let i = 0; i < upserts.length; i += CHUNK) {
+       const chunk = upserts.slice(i, i + CHUNK);
+@@ -167,7 +210,8 @@ Deno.serve(async (req: Request) => {
+       action: "import_bounces",
+       details: {
+         filename, resolvedFromColumn, resolvedFromText, unresolved,
+-        total: rows.length, trapsFound, senderIssueCounts, dateFallbackCount,
++        total: rows.length, trapsFound, senderIssueCounts, dateFallbackCount, ignoredCount,
++        senderEmail: senderEmailNorm, senderDomain,
+       },
+     });
+ 
+@@ -183,6 +227,7 @@ Deno.serve(async (req: Request) => {
+       trapsFound,
+       senderIssueCounts,
+       dateFallbackCount,
++      ignoredCount,
+     });
+   } catch (e) {
+     return jsonResponse({ error: String(e?.message ?? e) }, { status: 500 });
+diff --git a/supabase/migrations/0013_sender_scoped_unsubscribe.sql b/supabase/migrations/0013_sender_scoped_unsubscribe.sql
+new file mode 100644
+index 0000000..69ac343
+--- /dev/null
++++ b/supabase/migrations/0013_sender_scoped_unsubscribe.sql
+@@ -0,0 +1,117 @@
++-- =============================================================================
++-- Разделение блокировок по "виновности" (обсуждение с пользователем в чате):
++-- bounce-факт про сам адрес (не существует, переполнен и т.п.) и спам-жалоба
++-- (ok_fbl) блокируют ГЛОБАЛЬНО, как и раньше — это факт про адрес или про
++-- репутацию отправителя в целом (спам-жалоба бьёт по репутации домена у
++-- почтового провайдера получателя независимо от того, какая именно рассылка
++-- её вызвала). А вот ОТПИСКА (COMPLAINT_UNSUBSCRIBE, статус ok_unsubscribed)
++-- — это согласие относится к КОНКРЕТНОМУ отправителю: у админа 10 разных
++-- проектов с разными доменами, и отписка от рассылки course1.ru не должна
++-- блокировать отправку с домена course2.ru.
++--
++-- sender_domain = '' (пустая строка, НЕ null) — сентинел "глобальная
++-- запись", используется для всех bounce/spam/trap записей. NULL здесь не
++-- подошёл бы: в уникальном constraint два NULL никогда не считаются
++-- дубликатами, а два '' — считаются, что нам и нужно для конфликта upsert.
++-- Непустое значение sender_domain — только у записей COMPLAINT_UNSUBSCRIBE.
++-- =============================================================================
++
++alter table public.suppression_entries
++  add column if not exists sender_email text,
++  add column if not exists sender_domain text not null default '';
++
++-- Старый unique был просто на email_hash — теперь один и тот же адрес может
++-- легитимно иметь НЕСКОЛЬКО строк одновременно: одну глобальную
++-- (sender_domain = '') и по одной на каждый домен, от рассылок которого
++-- отписался.
++alter table public.suppression_entries
++  drop constraint if exists suppression_entries_email_hash_key;
++
++alter table public.suppression_entries
++  add constraint suppression_entries_hash_domain_key unique (email_hash, sender_domain);
++
++create index if not exists idx_suppression_sender_domain
++  on public.suppression_entries (sender_domain) where sender_domain <> '';
++
++-- ---------------------------------------------------------------------------
++-- upsert_suppression_batch: конфликт теперь по (email_hash, sender_domain),
++-- а не по email_hash — иначе запись об отписке от домена B перезаписала бы
++-- глобальную bounce-запись того же адреса (и наоборот).
++-- ---------------------------------------------------------------------------
++create or replace function public.upsert_suppression_batch(entries jsonb)
++returns void
++language plpgsql
++security definer
++set search_path = public
++as $$
++begin
++  insert into public.suppression_entries
++    (email_hash, domain, reason, category, action, is_trap, sender_email, sender_domain,
++     first_seen, last_seen, bounce_count, added_by)
++  select
++    e->>'email_hash',
++    e->>'domain',
++    e->>'reason',
++    e->>'category',
++    e->>'action',
++    coalesce((e->>'is_trap')::boolean, false),
++    e->>'sender_email',
++    coalesce(e->>'sender_domain', ''),
++    (e->>'last_seen')::date,
++    (e->>'last_seen')::date,
++    1,
++    (e->>'added_by')::uuid
++  from jsonb_array_elements(entries) as e
++  on conflict (email_hash, sender_domain) do update set
++    last_seen = excluded.last_seen,
++    bounce_count = suppression_entries.bounce_count + 1,
++    sender_email = excluded.sender_email,
++    -- reason/category/action/is_trap обновляются ТОЛЬКО если запись ещё не
++    -- была помечена как trap — иначе более мягкая категория из нового
++    -- отчёта могла бы "снять" опасный статус с адреса (как и раньше).
++    reason = case when suppression_entries.is_trap then suppression_entries.reason else excluded.reason end,
++    category = case when suppression_entries.is_trap then suppression_entries.category else excluded.category end,
++    action = case when suppression_entries.is_trap then suppression_entries.action else excluded.action end,
++    is_trap = suppression_entries.is_trap or excluded.is_trap;
++end;
++$$;
++
++-- ---------------------------------------------------------------------------
++-- check_suppression_hashes: добавлен параметр p_sender_domain. Глобальные
++-- записи (sender_domain = '') блокируют всегда, как и раньше (с той же
++-- логикой retry/is_trap/28-дневного окна из 0008). Записи с непустым
++-- sender_domain (отписки) блокируют ТОЛЬКО если проверка идёт для ТОГО ЖЕ
++-- домена — если p_sender_domain не передан, отписки вообще не учитываются
++-- (безопаснее промолчать, чем случайно заблокировать по чужому домену).
++-- Меняем сигнатуру функции — старую версию с одним параметром удаляем
++-- явно, чтобы не остались две перегруженные функции с одним и тем же
++-- именем.
++-- ---------------------------------------------------------------------------
++drop function if exists public.check_suppression_hashes(text[]);
++
++create or replace function public.check_suppression_hashes(hashes text[], p_sender_domain text default '')
++returns table (email_hash text)
++language sql
++security definer
++set search_path = public
++stable
++as $$
++  select se.email_hash
++  from public.suppression_entries se
++  where se.email_hash = any(hashes)
++    and (
++      se.sender_domain = ''
++      or se.sender_domain = coalesce(p_sender_domain, '')
++    )
++    and (
++      se.is_trap
++      or se.action is null
++      or se.action not ilike '%retry%'
++      or se.last_seen > (current_date - interval '28 days')
++    );
++$$;
++
++revoke execute on function public.check_suppression_hashes(text[], text) from public;
++revoke execute on function public.check_suppression_hashes(text[], text) from anon;
++revoke execute on function public.check_suppression_hashes(text[], text) from authenticated;
++grant execute on function public.check_suppression_hashes(text[], text) to service_role;
+diff --git a/web/app/admin/page.tsx b/web/app/admin/page.tsx
+index 5f6190d..2154d17 100644
+--- a/web/app/admin/page.tsx
++++ b/web/app/admin/page.tsx
+@@ -10,7 +10,7 @@ type Tab = "overview" | "checks" | "blocklists" | "audit" | "import";
+ type Check = { id: string; user_email: string; original_filename: string | null; status: string; total_rows: number | null; stats: Record<string, number> | null; error_message: string | null; result_storage_path: string | null; created_at: string; expires_at: string };
+ type Summary = { checks: { total: number; done: number; processing: number; error: number }; blocklists: { suppression: number; traps: number; retry: number; deadDomains: number }; imports: number };
+ type Audit = { id: number; admin_email: string; action: string; details: Record<string, unknown> | null; created_at: string };
+-type Suppression = { email_hash: string; domain: string; category: string | null; action: string | null; is_trap: boolean; last_seen: string | null; bounce_count: number };
++type Suppression = { email_hash: string; domain: string; category: string | null; reason_ru?: string; action: string | null; is_trap: boolean; sender_email: string | null; sender_domain: string | null; last_seen: string | null; bounce_count: number };
+ type DeadDomain = { domain: string; reason: string | null; last_confirmed_at: string; confirm_count: number };
+ const PAGE_SIZE = 50;
+ const DELETE = new Set(["INVALID_SYNTAX", "DELETE_SUPPRESSED", "DELETE_DISPOSABLE", "DELETE_DOMAIN_NOT_EXISTS", "TYPO_SUSPECTED", "EMPTY"]);
+@@ -36,6 +36,7 @@ export default function AdminPage() {
+   const [rowTotal, setRowTotal] = useState(0);
+   const [page, setPage] = useState(0);
+   const [emailColumn, setEmailColumn] = useState("");
++  const [senderEmail, setSenderEmail] = useState("");
+   const [importResult, setImportResult] = useState<any>(null);
+   const fileRef = useRef<HTMLInputElement>(null);
+ 
+@@ -61,7 +62,7 @@ export default function AdminPage() {
+   }
+   async function importBounce() {
+     const file = fileRef.current?.files?.[0]; if (!file) return; setBusy(true); setError(null); setImportResult(null);
+-    try { const { data } = await supabase.auth.getSession(); const session = data.session; if (!session) throw new Error("Сессия истекла."); const storagePath = `${session.user.id}/bounce_${Date.now()}_${file.name}`; const { error: uploadError } = await supabase.storage.from("uploads").upload(storagePath, file); if (uploadError) throw uploadError; const response = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/import-bounces`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ storagePath, filename: file.name, emailColumn: emailColumn || undefined }) }); const json = await response.json(); if (!response.ok) throw new Error(json.error ?? `Ошибка сервера (${response.status})`); setImportResult(json); if (fileRef.current) fileRef.current.value = ""; await loadDashboard(); } catch (e: any) { setError(e.message ?? String(e)); } finally { setBusy(false); }
++    try { const { data } = await supabase.auth.getSession(); const session = data.session; if (!session) throw new Error("Сессия истекла."); const storagePath = `${session.user.id}/bounce_${Date.now()}_${file.name}`; const { error: uploadError } = await supabase.storage.from("uploads").upload(storagePath, file); if (uploadError) throw uploadError; const response = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/import-bounces`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.access_token}` }, body: JSON.stringify({ storagePath, filename: file.name, emailColumn: emailColumn || undefined, senderEmail }) }); const json = await response.json(); if (!response.ok) throw new Error(json.error ?? `Ошибка сервера (${response.status})`); setImportResult(json); if (fileRef.current) fileRef.current.value = ""; await loadDashboard(); } catch (e: any) { setError(e.message ?? String(e)); } finally { setBusy(false); }
+   }
+   if (loading) return <div className="container">Загрузка...</div>;
+   if (!isAdmin) return null;
+@@ -74,7 +75,7 @@ export default function AdminPage() {
+     {tab === "checks" && <div className="card"><Title title="Проверки пользователей" text={`${visibleChecks.length} из ${checks.length}`} action={() => loadDashboard()} busy={busy} /><div className="filter-row"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Email пользователя или имя файла" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">Все статусы</option><option value="done">Готово</option><option value="processing">В работе</option><option value="error">Ошибка</option><option value="pending">В очереди</option></select></div><ChecksTable checks={visibleChecks} expanded={expanded} setExpanded={setExpanded} onDownload={downloadResult} /></div>}
+     {tab === "blocklists" && <div className="card"><Title title="Блоклисты" text="Открытые email не хранятся: suppression-list содержит только SHA-256 хэши." /><div className="button-row"><button className="secondary" onClick={() => exportCsv("suppression-csv", "suppression-list.csv")}>CSV suppression</button><button className="secondary" onClick={() => exportCsv("dead-domains-csv", "dead-domains.csv")}>CSV домены</button></div><div className="filter-row"><select value={kind} onChange={(e) => { setKind(e.target.value as "suppression" | "dead-domains"); setRows([]); setPage(0); }}><option value="suppression">Suppression-list</option><option value="dead-domains">Мёртвые домены</option></select><input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="Поиск по домену" />{kind === "suppression" && <><input value={category} onChange={(e) => setCategory(e.target.value)} placeholder="Категория" /><select value={trap} onChange={(e) => setTrap(e.target.value as "" | "true" | "false")}><option value="">Все записи</option><option value="true">Только spam trap</option><option value="false">Без spam trap</option></select></>}<button onClick={() => loadBlocklist(0)} disabled={busy}>{busy ? "Поиск..." : "Применить"}</button></div><BlocklistTable kind={kind} rows={rows} /><div className="pagination"><span className="muted">Найдено: {rowTotal}</span><button className="secondary" disabled={!page || busy} onClick={() => loadBlocklist(page - 1)}>Назад</button><span>{page + 1}</span><button className="secondary" disabled={(page + 1) * PAGE_SIZE >= rowTotal || busy} onClick={() => loadBlocklist(page + 1)}>Далее</button></div></div>}
+     {tab === "audit" && <div className="card"><Title title="Аудит импортов" text="Последние 100 административных действий." action={loadAudit} busy={busy} /><AuditTable entries={audit} /></div>}
+-    {tab === "import" && <div className="card"><h3>Импорт bounce-отчёта</h3><p className="muted">CSV/XLSX обрабатывается и удаляется сразу после импорта. В блоклист записываются SHA-256 хэши email.</p><input value={emailColumn} onChange={(e) => setEmailColumn(e.target.value)} placeholder="Название колонки с email, если нестандартное" /><input type="file" ref={fileRef} accept=".csv,.xlsx" /><button onClick={importBounce} disabled={busy}>{busy ? "Импорт..." : "Импортировать"}</button>{importResult && <div className="import-result"><p>Добавлено/обновлено: <b>{importResult.totalAddedOrUpdated}</b></p><p className="muted">Из колонки: {importResult.resolvedFromColumn} · из текста: {importResult.resolvedFromText} · не распознано: {importResult.unresolved}</p>{importResult.trapsFound > 0 && <p className="error">⚠ Spam trap: {importResult.trapsFound}</p>}{importResult.dateFallbackCount > 0 && <p className="muted">⚠ Дата не распознана в {importResult.dateFallbackCount} строк(ах) — использована сегодняшняя дата вместо даты из отчёта.</p>}</div>}</div>}
++    {tab === "import" && <div className="card"><h3>Импорт bounce-отчёта</h3><p className="muted">CSV/XLSX обрабатывается и удаляется сразу после импорта. В блоклист записываются SHA-256 хэши email.</p><input value={senderEmail} onChange={(e) => setSenderEmail(e.target.value)} placeholder="С какой почты отправляли (обязательно, например noreply@course1.ru)" /><input value={emailColumn} onChange={(e) => setEmailColumn(e.target.value)} placeholder="Название колонки с email, если нестандартное" /><input type="file" ref={fileRef} accept=".csv,.xlsx" /><button onClick={importBounce} disabled={busy || !senderEmail}>{busy ? "Импорт..." : "Импортировать"}</button>{importResult && <div className="import-result"><p>Добавлено/обновлено: <b>{importResult.totalAddedOrUpdated}</b></p><p className="muted">Из колонки: {importResult.resolvedFromColumn} · из текста: {importResult.resolvedFromText} · не распознано: {importResult.unresolved}</p>{importResult.trapsFound > 0 && <p className="error">⚠ Spam trap: {importResult.trapsFound}</p>}{importResult.dateFallbackCount > 0 && <p className="muted">⚠ Дата не распознана в {importResult.dateFallbackCount} строк(ах) — использована сегодняшняя дата вместо даты из отчёта.</p>}{importResult.ignoredCount > 0 && <p className="muted">Проигнорировано (доставлено/открыто/дубли и т.п., не bounce): {importResult.ignoredCount}</p>}</div>}</div>}
+   </div>;
+ }
+ 
+@@ -84,5 +85,5 @@ function ChecksTable({ checks, expanded, setExpanded, onDownload }: { checks: Ch
+   if (!checks.length) return <p className="muted">Нет проверок.</p>;
+   return <div className="table-wrap"><table><thead><tr><th>Файл / пользователь</th><th>Статус</th><th>Строк</th><th>Создана</th><th /></tr></thead><tbody>{checks.map((check) => { const isOpen = expanded === check.id; const stats = Object.entries(check.stats ?? {}); const remove = stats.filter(([key]) => DELETE.has(key)).reduce((sum, [, value]) => sum + value, 0); const review = stats.filter(([key]) => REVIEW.has(key)).reduce((sum, [, value]) => sum + value, 0); const keep = stats.filter(([key]) => !DELETE.has(key) && !REVIEW.has(key)).reduce((sum, [, value]) => sum + value, 0); return <Fragment key={check.id}><tr><td><b>{check.original_filename ?? "—"}</b><br /><span className="muted">{check.user_email}</span></td><td className={`status-${check.status === "done" ? "ok" : check.status === "error" ? "error" : "processing"}`}>{check.status}</td><td>{check.total_rows ?? "—"}</td><td>{date(check.created_at)}</td><td className="button-row"><button className="secondary" onClick={() => setExpanded(isOpen ? null : check.id)}>{isOpen ? "Скрыть" : "Детали"}</button>{check.status === "done" && check.result_storage_path && <button className="secondary" onClick={() => onDownload(check.id)}>Скачать</button>}</td></tr>{isOpen && <tr className="details-row"><td colSpan={5}>{check.error_message && <p className="error">{check.error_message}</p>}<p className="muted">Оставить: {keep} · проверить: {review} · удалить: {remove} · удаление: {date(check.expires_at)}</p><div className="stats-list">{stats.map(([key, value]) => <span key={key}>{key}: {value}</span>)}</div></td></tr>}</Fragment>; })}</tbody></table></div>;
+ }
+-function BlocklistTable({ kind, rows }: { kind: "suppression" | "dead-domains"; rows: Array<Suppression | DeadDomain> }) { if (!rows.length) return <p className="muted">Нажмите «Применить», чтобы загрузить данные.</p>; return kind === "dead-domains" ? <div className="table-wrap"><table><thead><tr><th>Домен</th><th>Причина</th><th>Подтверждён</th><th>Кол-во</th></tr></thead><tbody>{(rows as DeadDomain[]).map((row) => <tr key={row.domain}><td>{row.domain}</td><td>{row.reason ?? "—"}</td><td>{date(row.last_confirmed_at)}</td><td>{row.confirm_count}</td></tr>)}</tbody></table></div> : <div className="table-wrap"><table><thead><tr><th>Домен</th><th>Категория</th><th>Статус</th><th>Trap</th><th>Последний bounce</th><th>Кол-во</th></tr></thead><tbody>{(rows as Suppression[]).map((row) => <tr key={row.email_hash}><td>{row.domain}</td><td>{row.category ?? "—"}</td><td>{row.action ?? "—"}</td><td>{row.is_trap ? "Да" : "Нет"}</td><td>{date(row.last_seen)}</td><td>{row.bounce_count}</td></tr>)}</tbody></table></div>; }
++function BlocklistTable({ kind, rows }: { kind: "suppression" | "dead-domains"; rows: Array<Suppression | DeadDomain> }) { if (!rows.length) return <p className="muted">Нажмите «Применить», чтобы загрузить данные.</p>; return kind === "dead-domains" ? <div className="table-wrap"><table><thead><tr><th>Домен</th><th>Причина</th><th>Подтверждён</th><th>Кол-во</th></tr></thead><tbody>{(rows as DeadDomain[]).map((row) => <tr key={row.domain}><td>{row.domain}</td><td>{row.reason ?? "—"}</td><td>{date(row.last_confirmed_at)}</td><td>{row.confirm_count}</td></tr>)}</tbody></table></div> : <div className="table-wrap"><table><thead><tr><th>Домен</th><th>Категория</th><th>Причина (рус.)</th><th>Статус</th><th>Trap</th><th>Отправитель</th><th>Домен отправителя</th><th>Последний bounce</th><th>Кол-во</th></tr></thead><tbody>{(rows as Suppression[]).map((row) => <tr key={row.email_hash}><td>{row.domain}</td><td>{row.category ?? "—"}</td><td>{row.reason_ru ?? "—"}</td><td>{row.action ?? "—"}</td><td>{row.is_trap ? "Да" : "Нет"}</td><td>{row.sender_email ?? "—"}</td><td>{row.sender_domain || "— (глобально)"}</td><td>{date(row.last_seen)}</td><td>{row.bounce_count}</td></tr>)}</tbody></table></div>; }
+ function AuditTable({ entries }: { entries: Audit[] }) { if (!entries.length) return <p className="muted">Записей пока нет.</p>; return <div className="table-wrap"><table><thead><tr><th>Когда</th><th>Администратор</th><th>Действие</th><th>Результат</th></tr></thead><tbody>{entries.map((entry) => <tr key={entry.id}><td>{date(entry.created_at)}</td><td>{entry.admin_email}</td><td>{entry.action}</td><td className="muted">{entry.details?.filename ? `Файл: ${String(entry.details.filename)}; всего: ${String(entry.details.total ?? "—")}` : JSON.stringify(entry.details ?? {})}</td></tr>)}</tbody></table></div>; }
+diff --git a/web/app/page.tsx b/web/app/page.tsx
+index 6335e0a..779baa9 100644
+--- a/web/app/page.tsx
++++ b/web/app/page.tsx
+@@ -34,6 +34,7 @@ export default function HomePage() {
+   const { role } = useRole();
+   const [checks, setChecks] = useState<CheckRow[]>([]);
+   const [column, setColumn] = useState("email");
++  const [senderDomain, setSenderDomain] = useState("");
+   const [processing, setProcessing] = useState(false);
+   const [progress, setProgress] = useState<{ stage: ProgressStage; done: number; total: number } | null>(null);
+   const [error, setError] = useState<string | null>(null);
+@@ -76,7 +77,7 @@ export default function HomePage() {
+       // чтобы не упираться в CPU time limit на больших файлах
+       const { outputRows, stats } = await runCheck(file, column, (stage, done, total) => {
+         setProgress({ stage, done, total });
+-      });
++      }, senderDomain || undefined);
+ 
+       const blob = buildXlsxBlob(outputRows);
+       const resultPath = `${user.id}/${checkId}.xlsx`;
+@@ -154,6 +155,13 @@ export default function HomePage() {
+           placeholder="Название колонки с email (по умолчанию 'email')"
+           disabled={processing}
+         />
++        <input
++          type="text"
++          value={senderDomain}
++          onChange={(e) => setSenderDomain(e.target.value)}
++          placeholder="Для какого домена проверяем (например, course1.ru) — влияет на учёт отписок"
++          disabled={processing}
++        />
+         <input type="file" ref={fileInputRef} accept=".xlsx,.xls,.csv" disabled={processing} />
+         {error && <p className="error">{error}</p>}
+         {progress && (
+diff --git a/web/lib/processFile.ts b/web/lib/processFile.ts
+index 6b36c7e..705fa60 100644
+--- a/web/lib/processFile.ts
++++ b/web/lib/processFile.ts
+@@ -57,7 +57,12 @@ export type CheckOutcome = {
+ export async function runCheck(
+   file: File,
+   emailColumn: string,
+-  onProgress: ProgressCallback
++  onProgress: ProgressCallback,
++  // Домен, ДЛЯ КОТОРОГО проверяем список (например, courses1.ru). Записи об
++  // отписке в suppression-list привязаны к конкретному домену отправителя
++  // (см. миграцию 0013) — если не передать, такие записи не учитываются
++  // вообще, блокируются только глобальные bounce/spam-жалобы.
++  senderDomain?: string
+ ): Promise<CheckOutcome> {
+   onProgress("parsing", 0, 0);
+   const rows = await parseUploadedFile(file);
+@@ -157,7 +162,7 @@ export async function runCheck(
+   for (let i = 0; i < hashBatches.length; i++) {
+     const { suppressed } = await callEdgeFunction<{ suppressed: string[] }>(
+       "check-suppression",
+-      { hashes: hashBatches[i] }
++      { hashes: hashBatches[i], senderDomain: senderDomain || undefined }
+     );
+     for (const h of suppressed) suppressedHashes.add(h);
+     onProgress("suppression", (i + 1) * SUPPRESSION_BATCH, allHashes.length);

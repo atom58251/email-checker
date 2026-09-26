@@ -49,10 +49,18 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Требуются права администратора" }, { status: 403 });
   }
 
-  const { storagePath, filename, emailColumn } = await req.json();
+  const { storagePath, filename, emailColumn, senderEmail } = await req.json();
   if (!storagePath) {
     return jsonResponse({ error: "storagePath обязателен" }, { status: 400 });
   }
+  const senderEmailNorm = String(senderEmail ?? "").trim().toLowerCase();
+  if (!senderEmailNorm || !senderEmailNorm.includes("@")) {
+    return jsonResponse(
+      { error: "senderEmail обязателен — с какой почты/домена был этот отчёт (нужно для правильной привязки отписок к проекту)" },
+      { status: 400 }
+    );
+  }
+  const senderDomain = senderEmailNorm.split("@")[1];
 
   try {
     const { data: fileBlob, error: dlErr } = await admin.storage.from("uploads").download(storagePath);
@@ -62,8 +70,12 @@ Deno.serve(async (req: Request) => {
     const rows = parseUploadedFile(bytes, filename ?? "report.csv");
 
     if (rows.length === 0) throw new Error("Файл пуст");
-    if (!("category" in rows[0])) {
-      throw new Error(`В отчёте нет колонки 'category'. Найдены: ${Object.keys(rows[0]).join(", ")}`);
+    const CATEGORY_COL_ALIASES = ["category", "Результат отправки"];
+    const foundCategoryCol = CATEGORY_COL_ALIASES.find((c) => c in rows[0]);
+    if (!foundCategoryCol) {
+      throw new Error(
+        `В отчёте нет колонки категории (ожидалась одна из: ${CATEGORY_COL_ALIASES.join(", ")}). Найдены: ${Object.keys(rows[0]).join(", ")}`
+      );
     }
 
     const candidates = [emailColumn, "email", "address", "recipient", "recipient_email"].filter(Boolean);
@@ -74,6 +86,7 @@ Deno.serve(async (req: Request) => {
     let unresolved = 0;
     let trapsFound = 0;
     let dateFallbackCount = 0;
+    let ignoredCount = 0;
     const senderIssueCounts: Record<string, number> = {};
     const upserts: Array<{
       email_hash: string;
@@ -82,12 +95,17 @@ Deno.serve(async (req: Request) => {
       category: string;
       action: string;
       is_trap: boolean;
+      sender_email: string;
+      sender_domain: string;
       last_seen: string;
       added_by: string;
     }> = [];
 
     for (const row of rows) {
-      const category = String(row["category"] ?? "").trim();
+      // "Результат отправки" — реальное название колонки в выгрузке Unisender
+      // Go (см. обсуждение в чате); foundCategoryCol определён выше по тому
+      // же списку алиасов, которым уже прошла валидация файла.
+      const category = String(row[foundCategoryCol] ?? "").trim();
       // ВАЖНО: action НЕ берём дословно из файла. У разных источников разные
       // слова для одного и того же смысла — у Postal action='RETRY in 2-4
       // weeks' (содержит 'retry'), у Listmonk та же по сути ситуация
@@ -99,13 +117,27 @@ Deno.serve(async (req: Request) => {
       // Поэтому action всегда выводим из НАШЕЙ классификации категории —
       // она единый источник истины и для "хранить или нет", и для
       // "навсегда или временно".
-      const dateRaw = String(row["sent_utc"] ?? row["added_utc"] ?? "").trim();
+      const dateRaw = String(row["sent_utc"] ?? row["added_utc"] ?? row["Время обновления"] ?? "").trim();
       const dateNormalized = normalizeReportDate(dateRaw);
       if (dateRaw && !dateNormalized) dateFallbackCount++;
       const text = String(row["smtp_response"] ?? row["last_response"] ?? "");
 
       const bucket = classifyCategory(category);
-      const action = bucket === "RETRY_LATER" ? "RETRY in 2-4 weeks" : "DELETE from list";
+
+      // IGNORE: статус не говорит о проблеме с адресом вообще (успешная
+      // доставка/открытие/клик, дубль внутри той же рассылки Unisender,
+      // ещё не финальный статус) — пропускаем молча, даже не засоряя
+      // сводку senderIssueCounts (иначе на большой базе "ok_read: 50000"
+      // забьёт собой реально полезные предупреждения в сводке).
+      if (bucket === "IGNORE") {
+        ignoredCount++;
+        continue;
+      }
+
+      const action =
+        bucket === "RETRY_LATER" ? "RETRY in 2-4 weeks" :
+        bucket === "COMPLAINT_UNSUBSCRIBE" ? "DELETE — complaint/unsubscribe" :
+        "DELETE from list";
 
       // SENDER_ISSUE: проблема отправителя (throttling, временная
       // недоступность сервера, отказ по политике) — НЕ повод удалять
@@ -136,6 +168,12 @@ Deno.serve(async (req: Request) => {
         const domain = emailNorm.split("@")[1];
         const isTrap = bucket === "TRAP";
         if (isTrap) trapsFound++;
+        // Глобальная блокировка (bounce-факт про адрес, спам-жалоба) —
+        // sender_domain = '' (сентинел из 0013). Только отписка
+        // (COMPLAINT_UNSUBSCRIBE) привязывается к конкретному домену
+        // отправителя: у админа 10 проектов на разных доменах, и отписка
+        // от одного не должна блокировать рассылки с другого.
+        const entrySenderDomain = bucket === "COMPLAINT_UNSUBSCRIBE" ? senderDomain : "";
         upserts.push({
           email_hash: await hashEmail(emailNorm),
           domain,
@@ -143,6 +181,8 @@ Deno.serve(async (req: Request) => {
           category,
           action,
           is_trap: isTrap,
+          sender_email: senderEmailNorm,
+          sender_domain: entrySenderDomain,
           last_seen: dateNormalized ?? new Date().toISOString().slice(0, 10),
           added_by: adminUserId,
         });
@@ -151,8 +191,11 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // upsert по email_hash: если запись уже есть — обновляем last_seen/bounce_count
-    // через RPC (простой upsert с increment пишем как отдельный SQL-вызов)
+    // upsert по (email_hash, sender_domain): если запись уже есть — обновляем
+    // last_seen/bounce_count через RPC (см. 0013_sender_scoped_unsubscribe.sql —
+    // конфликт теперь по паре, а не только по email_hash, чтобы глобальная
+    // bounce-запись и запись об отписке от конкретного домена не затирали
+    // друг друга).
     const CHUNK = 500;
     for (let i = 0; i < upserts.length; i += CHUNK) {
       const chunk = upserts.slice(i, i + CHUNK);
@@ -167,7 +210,8 @@ Deno.serve(async (req: Request) => {
       action: "import_bounces",
       details: {
         filename, resolvedFromColumn, resolvedFromText, unresolved,
-        total: rows.length, trapsFound, senderIssueCounts, dateFallbackCount,
+        total: rows.length, trapsFound, senderIssueCounts, dateFallbackCount, ignoredCount,
+        senderEmail: senderEmailNorm, senderDomain,
       },
     });
 
@@ -183,6 +227,7 @@ Deno.serve(async (req: Request) => {
       trapsFound,
       senderIssueCounts,
       dateFallbackCount,
+      ignoredCount,
     });
   } catch (e) {
     return jsonResponse({ error: String(e?.message ?? e) }, { status: 500 });

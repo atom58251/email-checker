@@ -57,7 +57,12 @@ export type CheckOutcome = {
 export async function runCheck(
   file: File,
   emailColumn: string,
-  onProgress: ProgressCallback
+  onProgress: ProgressCallback,
+  // Домен, ДЛЯ КОТОРОГО проверяем список (например, courses1.ru). Записи об
+  // отписке в suppression-list привязаны к конкретному домену отправителя
+  // (см. миграцию 0013) — если не передать, такие записи не учитываются
+  // вообще, блокируются только глобальные bounce/spam-жалобы.
+  senderDomain?: string
 ): Promise<CheckOutcome> {
   onProgress("parsing", 0, 0);
   const rows = await parseUploadedFile(file);
@@ -157,7 +162,7 @@ export async function runCheck(
   for (let i = 0; i < hashBatches.length; i++) {
     const { suppressed } = await callEdgeFunction<{ suppressed: string[] }>(
       "check-suppression",
-      { hashes: hashBatches[i] }
+      { hashes: hashBatches[i], senderDomain: senderDomain || undefined }
     );
     for (const h of suppressed) suppressedHashes.add(h);
     onProgress("suppression", (i + 1) * SUPPRESSION_BATCH, allHashes.length);

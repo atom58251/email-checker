@@ -1,0 +1,310 @@
+diff --git a/README.md b/README.md
+index e49c8f0..cd8e43c 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@
+ получают результат (keep/delete), админ пополняет базу известных
+ недействительных адресов (suppression-list) из bounce-отчётов.
+ 
+-- **Фронтенд:** Next.js → Vercel (бесплатный тариф Hobby)
++- **Фронтенд:** Next.js → Netlify (бесплатный тариф Starter/Free)
+ - **Backend + БД:** Supabase (Postgres + Auth + Storage + Edge Functions,
+   бесплатный тариф Free)
+ - **Проверки:** только офлайн — синтаксис, опечатки, disposable-домены,
+@@ -16,7 +16,7 @@
+ ## 1. Архитектура
+ 
+ ```
+-Пользователь → Vercel (Next.js) → БРАУЗЕР: разбор файла, офлайн-проверки,
++Пользователь → Netlify (Next.js) → БРАУЗЕР: разбор файла, офлайн-проверки,
+                                             SHA-256 хэши (lib/processFile.ts)
+                                   → Edge Function 'check-suppression'
+                                        (батчами по 2000 хэшей → Postgres)
+@@ -27,7 +27,7 @@
+                                   → Storage bucket 'results' (сам пользователь)
+                                   → скачивание через signed URL (60 сек)
+ 
+-Админ → Vercel /admin → Storage 'uploads' → Edge Function 'import-bounces'
++Админ → Netlify /admin → Storage 'uploads' → Edge Function 'import-bounces'
+                                              └─ email → SHA-256 хэш → suppression_entries
+ ```
+ 
+@@ -74,26 +74,43 @@
+    ```sql
+    update public.profiles set role = 'admin' where id = '<ваш user_id из auth.users>';
+    ```
+-8. (Опционально) Включите Cron Jobs в Dashboard → Database → Cron Jobs
+-   для ежедневного вызова `purge-expired` — см. комментарий в конце
+-   `supabase/migrations/0001_init.sql`.
++8. Включите Cron Jobs в Dashboard → Database → Cron Jobs для вызова
++   `purge-expired` **не реже раза в час** (не раз в сутки — при TTL
++   в 1 день редкий запуск даёт данным висеть в базе на сутки-двое
++   вместо суток). Пример SQL для Dashboard:
++   ```sql
++   select cron.schedule('purge-expired-checks', '0 * * * *',
++     $$ select public.purge_expired_checks(); select net.http_post(
++          url:='https://<project>.functions.supabase.co/purge-expired',
++          headers:='{"Authorization": "Bearer <service_role_key>"}'::jsonb); $$);
++   ```
+ 
+ ---
+ 
+-## 3. Деплой фронтенда на Vercel
+-
+-1. Залейте папку `web/` в свой GitHub-репозиторий (можно — весь проект,
+-   Vercel сам найдёт `web/` как корень, если укажете Root Directory).
+-2. На [vercel.com](https://vercel.com) → New Project → импортируйте репозиторий,
+-   Root Directory = `web`.
+-3. Добавьте переменные окружения (Project Settings → Environment Variables):
++## 3. Деплой фронтенда на Netlify
++
++1. Залейте проект в свой GitHub-репозиторий.
++2. На [netlify.com](https://netlify.com) → Add new site → Import an existing
++   project → выберите репозиторий.
++3. В настройках сборки (Site settings → Build & deploy → Base directory):
++   - **Base directory**: `web`
++   - **Build command**: `npm run build`
++   - **Publish directory**: Netlify сам подставит нужную для Next.js
++     (через встроенный `@netlify/plugin-nextjs` — он подключается
++     автоматически, когда Netlify видит Next.js проект, отдельный
++     `netlify.toml` для этого не обязателен).
++4. Добавьте переменные окружения (Site settings → Environment variables):
+    - `NEXT_PUBLIC_SUPABASE_URL`
+    - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+ 
+    Оба значения — из Supabase Dashboard → Project Settings → API.
+-   **Не добавляйте service_role key на Vercel** — фронтенду он не нужен
++   **Не добавляйте service_role key на Netlify** — фронтенду он не нужен
+    и не должен быть доступен браузеру ни в каком виде.
+-4. Deploy. Готово — Vercel даёт бесплатный домен `*.vercel.app`.
++5. Deploy. Готово — Netlify даёт бесплатный домен `*.netlify.app`.
++6. Если Netlify подключён к GitHub (Continuous Deployment включён по
++   умолчанию при импорте через Git) — каждый `git push` в основную ветку
++   автоматически запускает пересборку и деплой, вручную ничего жать не
++   нужно.
+ 
+ ---
+ 
+@@ -114,7 +131,7 @@ npm run dev
+ жизненного цикла данных, как вы просили.
+ 
+ ### 5.1 Сбор и передача (in transit)
+-- Vercel и Supabase используют HTTPS/TLS по умолчанию везде — от браузера
++- Netlify и Supabase используют HTTPS/TLS по умолчанию везде — от браузера
+   до Storage и Edge Functions. Отдельно настраивать не нужно.
+ - Файл пользователя загружается напрямую в Supabase Storage из браузера
+   (через authenticated-запрос с anon key + RLS), не проходя через
+@@ -144,9 +161,11 @@ npm run dev
+ - Загруженный пользователем файл удаляется из bucket `uploads` сразу
+   после обработки — не хранится "просто на всякий случай".
+ - И результаты, и метаданные проверки автоматически удаляются через
+-  14 дней (`expires_at` в таблице `checks` + Edge Function
+-  `purge-expired`, вызываемая по расписанию). Срок можно изменить в
+-  миграции.
++  **1 день** (`expires_at` в таблице `checks` + Edge Function
++  `purge-expired`, вызываемая по расписанию не реже раза в час). Срок
++  можно изменить в миграции `0012_short_retention.sql`. Важно: это
++  жёсткое удаление — если пользователь не скачал результат в течение
++  суток, файл и запись о проверке пропадают безвозвратно.
+ - Скачивание результата — через **временную signed URL (60 секунд)**,
+   а не через постоянную публичную ссылку на файл.
+ 
+@@ -161,7 +180,7 @@ npm run dev
+   документ, а не код; нужен, если сервисом будут пользоваться третьи
+   лица, особенно из ЕС (GDPR) — у вас как минимум работает 14-дневное
+   хранение, это стоит явно прописать пользователю.
+-- **Договор с Supabase/Vercel как с обработчиками данных** (Data
++- **Договор с Supabase/Netlify как с обработчиками данных** (Data
+   Processing Agreement) — у обоих есть готовые DPA, доступные в аккаунте,
+   подписываются в пару кликов, если это требуется по вашей юрисдикции.
+ - **2FA для админского аккаунта** — Supabase Auth поддерживает, включите
+@@ -220,8 +239,9 @@ web/
+   запрос после паузы будет медленным, дальше нормально); 500 MB БД,
+   1 GB Storage, 2 GB egress/мес — для текстовых email-списков этого
+   надолго хватит.
+-- **Vercel Hobby:** только для некоммерческого использования по их
+-  условиям; серверные функции ограничены по времени выполнения (не
+-  критично здесь — вся тяжёлая работа в Supabase Edge Functions).
++- **Netlify Free (Starter):** в отличие от Vercel Hobby, коммерческое
++  использование разрешено; лимиты — 100 GB bandwidth/мес, 300 минут
++  сборки/мес, 125k вызовов функций/мес (серверные функции здесь не
++  критичны — вся тяжёлая работа в Supabase Edge Functions).
+ - Оба сервиса не гарантируют SLA на бесплатном тарифе — для чего-то
+   критичного к аптайму стоит рассматривать платный план после теста.
+diff --git a/supabase/functions/_shared/emailUtils.ts b/supabase/functions/_shared/emailUtils.ts
+index 7ad35e2..1e9a9b8 100644
+--- a/supabase/functions/_shared/emailUtils.ts
++++ b/supabase/functions/_shared/emailUtils.ts
+@@ -180,6 +180,56 @@ export const REVIEW_STATUSES = new Set(["NO_MAIL_SUSPECTED", "DNS_INCONCLUSIVE",
+ // =============================================================================
+ export type CategoryBucket = "PERMANENT_BLOCK" | "TRAP" | "RETRY_LATER" | "SENDER_ISSUE";
+ 
++/**
++ * Приводит значение даты из bounce-отчёта к формату YYYY-MM-DD, который
++ * Postgres примет для last_seen (тип date). Разные провайдеры присылают
++ * дату по-разному (ISO, DD.MM.YYYY, unix-timestamp, Excel serial-число),
++ * а иногда колонка содержит вообще не дату (см. падение всего импорта
++ * из-за одной строки со значением "1434.1" — ::date не смог её разобрать
++ * и упал весь батч из 500 записей). Возвращает null, если распознать не
++ * удалось — вызывающий код в этом случае берёт текущую дату вместо того,
++ * чтобы ронять импорт целиком из-за одной строки.
++ */
++export function normalizeReportDate(raw: string): string | null {
++  const v = raw.trim();
++  if (!v) return null;
++
++  // ISO 8601: 2026-01-16 или 2026-01-16T14:34:01(.123)?(Z)?
++  const iso = /^(\d{4}-\d{2}-\d{2})/.exec(v);
++  if (iso && !isNaN(new Date(v).getTime())) return iso[1];
++
++  // DD.MM.YYYY / DD/MM/YYYY / DD-MM-YYYY, опционально с временем следом
++  const dmy = /^(\d{1,2})[.\/-](\d{1,2})[.\/-](\d{4})\b/.exec(v);
++  if (dmy) {
++    const day = Number(dmy[1]), month = Number(dmy[2]), year = Number(dmy[3]);
++    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
++      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
++    }
++  }
++
++  // Unix timestamp: 10 цифр (секунды) или 13 цифр (миллисекунды)
++  if (/^\d{10}$/.test(v)) {
++    const d = new Date(Number(v) * 1000);
++    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
++  }
++  if (/^\d{13}$/.test(v)) {
++    const d = new Date(Number(v));
++    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
++  }
++
++  // Excel serial date (целая часть — дни с 1899-12-30). Ограничиваем
++  // правдоподобным диапазоном (~2000–2100 гг.), чтобы не принять за дату
++  // случайное число из совсем другой колонки.
++  const num = Number(v);
++  if (!isNaN(num) && num >= 36526 && num <= 73050) {
++    const ms = Math.round((num - 25569) * 86400 * 1000);
++    const d = new Date(ms);
++    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
++  }
++
++  return null;
++}
++
+ const CATEGORY_RULES: Array<[string, CategoryBucket]> = [
+   ["address does not exist", "PERMANENT_BLOCK"],
+   ["invalid_mailbox", "PERMANENT_BLOCK"],
+diff --git a/supabase/functions/import-bounces/index.ts b/supabase/functions/import-bounces/index.ts
+index 4cb6f4a..664728b 100644
+--- a/supabase/functions/import-bounces/index.ts
++++ b/supabase/functions/import-bounces/index.ts
+@@ -12,7 +12,7 @@
+ //     и возвращаются в ответе как unresolvedCount, без попытки угадать)
+ // =============================================================================
+ import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+-import { hashEmail, checkSyntax, EMAIL_IN_TEXT_RE, classifyCategory } from "../_shared/emailUtils.ts";
++import { hashEmail, checkSyntax, EMAIL_IN_TEXT_RE, classifyCategory, normalizeReportDate } from "../_shared/emailUtils.ts";
+ import { parseUploadedFile } from "../_shared/parseFile.ts";
+ import { handleCorsPreflight, jsonResponse } from "../_shared/cors.ts";
+ 
+@@ -73,6 +73,7 @@ Deno.serve(async (req: Request) => {
+     let resolvedFromText = 0;
+     let unresolved = 0;
+     let trapsFound = 0;
++    let dateFallbackCount = 0;
+     const senderIssueCounts: Record<string, number> = {};
+     const upserts: Array<{
+       email_hash: string;
+@@ -98,7 +99,9 @@ Deno.serve(async (req: Request) => {
+       // Поэтому action всегда выводим из НАШЕЙ классификации категории —
+       // она единый источник истины и для "хранить или нет", и для
+       // "навсегда или временно".
+-      const dateStr = String(row["sent_utc"] ?? row["added_utc"] ?? "").trim();
++      const dateRaw = String(row["sent_utc"] ?? row["added_utc"] ?? "").trim();
++      const dateNormalized = normalizeReportDate(dateRaw);
++      if (dateRaw && !dateNormalized) dateFallbackCount++;
+       const text = String(row["smtp_response"] ?? row["last_response"] ?? "");
+ 
+       const bucket = classifyCategory(category);
+@@ -140,7 +143,7 @@ Deno.serve(async (req: Request) => {
+           category,
+           action,
+           is_trap: isTrap,
+-          last_seen: dateStr || new Date().toISOString(),
++          last_seen: dateNormalized ?? new Date().toISOString().slice(0, 10),
+           added_by: adminUserId,
+         });
+       } else {
+@@ -164,7 +167,7 @@ Deno.serve(async (req: Request) => {
+       action: "import_bounces",
+       details: {
+         filename, resolvedFromColumn, resolvedFromText, unresolved,
+-        total: rows.length, trapsFound, senderIssueCounts,
++        total: rows.length, trapsFound, senderIssueCounts, dateFallbackCount,
+       },
+     });
+ 
+@@ -179,6 +182,7 @@ Deno.serve(async (req: Request) => {
+       totalAddedOrUpdated: upserts.length,
+       trapsFound,
+       senderIssueCounts,
++      dateFallbackCount,
+     });
+   } catch (e) {
+     return jsonResponse({ error: String(e?.message ?? e) }, { status: 500 });
+diff --git a/supabase/migrations/0012_short_retention.sql b/supabase/migrations/0012_short_retention.sql
+new file mode 100644
+index 0000000..5d2b46d
+--- /dev/null
++++ b/supabase/migrations/0012_short_retention.sql
+@@ -0,0 +1,26 @@
++-- =============================================================================
++-- Сокращаем срок хранения результатов проверки с 14 дней до 1 дня.
++--
++-- Раньше: expires_at = now() + 14 дней.
++-- Теперь: expires_at = now() + 1 день — минимизируем время жизни данных
++-- пользовательских списков (email из чужих списков — чувствительные данные,
++-- незачем им лежать в Storage/БД дольше, чем реально нужно, чтобы скачать
++-- результат).
++--
++-- ВАЖНО: это меняет UX — пользователь должен скачать результат В ТЕЧЕНИЕ
++-- СУТОК после обработки, иначе purge-expired удалит и файл, и саму строку
++-- checks безвозвратно (жёсткое удаление, не "мягкое" истечение).
++--
++-- Существующие строки, у которых expires_at уже выставлен на 14 дней
++-- вперёд, ЭТОЙ миграцией не трогаются (default применяется только к новым
++-- INSERT). Если нужно, чтобы уже загруженные ранее списки тоже стали
++-- короткоживущими — раскомментируйте UPDATE ниже.
++-- =============================================================================
++
++alter table public.checks
++  alter column expires_at set default (now() + interval '1 day');
++
++-- Раскомментировать, если нужно применить новый срок и к уже загруженным
++-- ранее спискам (аккуратно — это может удалить историю, которую пользователь
++-- ещё не скачал):
++-- update public.checks set expires_at = created_at + interval '1 day';
+diff --git a/web/app/admin/page.tsx b/web/app/admin/page.tsx
+index f28e405..5f6190d 100644
+--- a/web/app/admin/page.tsx
++++ b/web/app/admin/page.tsx
+@@ -74,7 +74,7 @@ export default function AdminPage() {
+     {tab === "checks" && <div className="card"><Title title="Проверки пользователей" text={`${visibleChecks.length} из ${checks.length}`} action={() => loadDashboard()} busy={busy} /><div className="filter-row"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Email пользователя или имя файла" /><select value={status} onChange={(e) => setStatus(e.target.value)}><option value="all">Все статусы</option><option value="done">Готово</option><option value="processing">В работе</option><option value="error">Ошибка</option><option value="pending">В очереди</option></select></div><ChecksTable checks={visibleChecks} expanded={expanded} setExpanded={setExpanded} onDownload={downloadResult} /></div>}
+     {tab === "blocklists" && <div className="card"><Title title="Блоклисты" text="Открытые email не хранятся: suppression-list содержит только SHA-256 хэши." /><div className="button-row"><button className="secondary" onClick={() => exportCsv("suppression-csv", "suppression-list.csv")}>CSV suppression</button><button className="secondary" onClick={() => exportCsv("dead-domains-csv", "dead-domains.csv")}>CSV домены</button></div><div className="filter-row"><select value={kind} onChange={(e) => { setKind(e.target.value as "suppression" | "dead-domains"); setRows([]); setPage(0); }}><option value="suppression">Suppression-list</option><option value="dead-domains">Мёртвые домены</option></select><input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="Поиск по домену" />{kind === "suppression" && <><input value={category} onChange={(e) => setCategory(e.target.value)} placeholder="Категория" /><select value={trap} onChange={(e) => setTrap(e.target.value as "" | "true" | "false")}><option value="">Все записи</option><option value="true">Только spam trap</option><option value="false">Без spam trap</option></select></>}<button onClick={() => loadBlocklist(0)} disabled={busy}>{busy ? "Поиск..." : "Применить"}</button></div><BlocklistTable kind={kind} rows={rows} /><div className="pagination"><span className="muted">Найдено: {rowTotal}</span><button className="secondary" disabled={!page || busy} onClick={() => loadBlocklist(page - 1)}>Назад</button><span>{page + 1}</span><button className="secondary" disabled={(page + 1) * PAGE_SIZE >= rowTotal || busy} onClick={() => loadBlocklist(page + 1)}>Далее</button></div></div>}
+     {tab === "audit" && <div className="card"><Title title="Аудит импортов" text="Последние 100 административных действий." action={loadAudit} busy={busy} /><AuditTable entries={audit} /></div>}
+-    {tab === "import" && <div className="card"><h3>Импорт bounce-отчёта</h3><p className="muted">CSV/XLSX обрабатывается и удаляется сразу после импорта. В блоклист записываются SHA-256 хэши email.</p><input value={emailColumn} onChange={(e) => setEmailColumn(e.target.value)} placeholder="Название колонки с email, если нестандартное" /><input type="file" ref={fileRef} accept=".csv,.xlsx" /><button onClick={importBounce} disabled={busy}>{busy ? "Импорт..." : "Импортировать"}</button>{importResult && <div className="import-result"><p>Добавлено/обновлено: <b>{importResult.totalAddedOrUpdated}</b></p><p className="muted">Из колонки: {importResult.resolvedFromColumn} · из текста: {importResult.resolvedFromText} · не распознано: {importResult.unresolved}</p>{importResult.trapsFound > 0 && <p className="error">⚠ Spam trap: {importResult.trapsFound}</p>}</div>}</div>}
++    {tab === "import" && <div className="card"><h3>Импорт bounce-отчёта</h3><p className="muted">CSV/XLSX обрабатывается и удаляется сразу после импорта. В блоклист записываются SHA-256 хэши email.</p><input value={emailColumn} onChange={(e) => setEmailColumn(e.target.value)} placeholder="Название колонки с email, если нестандартное" /><input type="file" ref={fileRef} accept=".csv,.xlsx" /><button onClick={importBounce} disabled={busy}>{busy ? "Импорт..." : "Импортировать"}</button>{importResult && <div className="import-result"><p>Добавлено/обновлено: <b>{importResult.totalAddedOrUpdated}</b></p><p className="muted">Из колонки: {importResult.resolvedFromColumn} · из текста: {importResult.resolvedFromText} · не распознано: {importResult.unresolved}</p>{importResult.trapsFound > 0 && <p className="error">⚠ Spam trap: {importResult.trapsFound}</p>}{importResult.dateFallbackCount > 0 && <p className="muted">⚠ Дата не распознана в {importResult.dateFallbackCount} строк(ах) — использована сегодняшняя дата вместо даты из отчёта.</p>}</div>}</div>}
+   </div>;
+ }
+ 
+diff --git a/web/lib/supabaseClient.ts b/web/lib/supabaseClient.ts
+index 4911a41..5ab9a34 100644
+--- a/web/lib/supabaseClient.ts
++++ b/web/lib/supabaseClient.ts
+@@ -12,7 +12,7 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+ if (!supabaseUrl || !supabaseAnonKey) {
+   throw new Error(
+     "Не заданы NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY. " +
+-      "Добавьте их в переменные окружения проекта на Vercel."
++      "Добавьте их в переменные окружения проекта на Netlify."
+   );
+ }
+ 

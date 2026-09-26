@@ -178,7 +178,22 @@ export const REVIEW_STATUSES = new Set(["NO_MAIL_SUSPECTED", "DNS_INCONCLUSIVE",
 // разрешить "смягчить" повторным импортом с другой категорией
 // (см. is_trap и upsert_suppression_batch в 0004_trap_protection.sql).
 // =============================================================================
-export type CategoryBucket = "PERMANENT_BLOCK" | "TRAP" | "RETRY_LATER" | "SENDER_ISSUE";
+export type CategoryBucket =
+  | "PERMANENT_BLOCK"
+  | "TRAP"
+  | "RETRY_LATER"
+  | "SENDER_ISSUE"
+  | "COMPLAINT_UNSUBSCRIBE" // получатель сам отказался (отписка) или пожаловался
+                            // на спам (FBL) — адрес РАБОЧИЙ, это не bounce,
+                            // но результат тот же: больше не отправлять.
+                            // Храним отдельно от PERMANENT_BLOCK, чтобы не
+                            // путать "адрес мёртв" с "адрес жив, но просил
+                            // не писать" при разборе блоклиста позже.
+  | "IGNORE";               // не несёт информации о проблеме с адресом
+                             // (успешная доставка/открытие/клик, дубль
+                             // внутри той же рассылки, ещё не финальный
+                             // статус) — не пишем в suppression и не
+                             // засоряем сводку senderIssueCounts.
 
 /**
  * Приводит значение даты из bounce-отчёта к формату YYYY-MM-DD, который
@@ -247,6 +262,54 @@ const CATEGORY_RULES: Array<[string, CategoryBucket]> = [
   ["mail_server_unreachable", "SENDER_ISSUE"],
   ["server_refuses_mail", "SENDER_ISSUE"],
   ["gmail_throttling", "SENDER_ISSUE"],
+
+  // ===========================================================================
+  // Unisender Go — расширенные статусы писем (godocs.unisender.ru/email-statuses).
+  // Коды именно в таком виде приходят в колонке "Результат отправки" их
+  // выгрузки (см. обсуждение с пользователем в чате) — сравнение ниже по
+  // вхождению подстроки, поэтому регистр и небольшие вариации не критичны.
+  // ===========================================================================
+
+  // Несуществующие/погибшие адреса — реальный ответ сервера о недоставке.
+  ["err_user_unknown", "PERMANENT_BLOCK"],
+  ["err_user_inactive", "PERMANENT_BLOCK"],
+  ["err_mailbox_discarded", "PERMANENT_BLOCK"],
+  ["err_domain_inactive", "PERMANENT_BLOCK"],
+  // err_unreachable у Unisender формально "temp ~6 месяцев", но полгода
+  // достаточно долго, чтобы практичнее сразу считать адрес мёртвым, чем
+  // держать его в рассылках ещё столько времени.
+  ["err_unreachable", "PERMANENT_BLOCK"],
+
+  // Временные проблемы у получателя — адрес рабочий.
+  ["err_mailbox_full", "RETRY_LATER"], // дублирует "mailbox_full" выше, оставлено явно для читаемости
+  ["err_skip_letter", "RETRY_LATER"],
+
+  // Проблема на стороне ОТПРАВИТЕЛЯ (репутация/контент/конфигурация) —
+  // адрес получателя ни при чём, банить его нельзя.
+  ["err_spam_rejected", "SENDER_ISSUE"],
+  ["err_spam_skipped", "SENDER_ISSUE"],
+  ["err_spam_removed", "SENDER_ISSUE"],
+  ["err_blacklisted", "SENDER_ISSUE"], // это про ваш IP/домен в чёрных списках, не про адрес получателя
+  ["err_destination_misconfigured", "SENDER_ISSUE"],
+  ["err_delivery_failed", "SENDER_ISSUE"], // недостаточно детализировано, безопаснее не банить
+  ["err_lost", "SENDER_ISSUE"],
+  ["err_internal", "SENDER_ISSUE"],
+  ["err_too_large", "SENDER_ISSUE"],
+
+  // Получатель сам отказался/пожаловался — адрес рабочий, но писать нельзя.
+  ["ok_unsubscribed", "COMPLAINT_UNSUBSCRIBE"],
+  ["ok_fbl", "COMPLAINT_UNSUBSCRIBE"],
+  ["ok_spam_folder", "COMPLAINT_UNSUBSCRIBE"],
+
+  // Позитивные и технические статусы — ничего не говорят о проблеме адреса.
+  ["ok_sent", "IGNORE"],
+  ["ok_delivered", "IGNORE"],
+  ["ok_read", "IGNORE"],
+  ["ok_link_visited", "IGNORE"],
+  ["err_will_retry", "IGNORE"],      // ещё не финальный статус
+  ["skip_dup_unreachable", "IGNORE"],       // дубль внутри рассылки, событие уже учтено по первому вхождению
+  ["skip_dup_temp_unreachable", "IGNORE"],
+  ["skip_dup_mailbox_full", "IGNORE"],
 ];
 
 /**
@@ -262,4 +325,62 @@ export function classifyCategory(category: string): CategoryBucket {
     if (text.includes(key)) return bucket;
   }
   return "SENDER_ISSUE";
+}
+
+// =============================================================================
+// Человекочитаемая причина на русском — для показа в UI блоклиста и в
+// CSV-выгрузке (по аналогии с тем, как Юнисендер показывает понятные
+// формулировки, а не только код статуса). Отдельно от CATEGORY_RULES, т.к.
+// это про читаемость для человека, а не про бакет для логики блокировки —
+// один код может звучать по-разному, но вести себя одинаково, поэтому
+// список ключей здесь такой же, а результат — просто текст, не bucket.
+// =============================================================================
+const CATEGORY_LABELS_RU: Array<[string, string]> = [
+  ["address does not exist", "Адрес не существует"],
+  ["invalid_mailbox", "Ящик не существует"],
+  ["invalid mailbox", "Ящик не существует"],
+  ["domain_has_no_mail_server", "У домена нет почтового сервера"],
+  ["broken mx record", "Битая MX-запись"],
+  ["yandex account blocked by yandex", "Аккаунт заблокирован Яндексом"],
+  ["disposable inbox service", "Одноразовый почтовый сервис"],
+  ["disposable_or_trap", "Одноразовый адрес или спам-ловушка"],
+  ["mailbox_full", "Ящик переполнен"],
+  ["mailbox full", "Ящик переполнен"],
+  ["mail_server_unreachable", "Сервер получателя недоступен (не вина адреса)"],
+  ["server_refuses_mail", "Сервер отклоняет почту (проблема отправителя)"],
+  ["gmail_throttling", "Ограничение скорости от Gmail (не вина адреса)"],
+
+  // Unisender Go
+  ["err_user_unknown", "Ящик не существует"],
+  ["err_user_inactive", "Ящик не используется получателем"],
+  ["err_mailbox_discarded", "Ящик удалён"],
+  ["err_domain_inactive", "Домен не принимает почту"],
+  ["err_unreachable", "Адрес долго недоступен (~6 месяцев)"],
+  ["err_mailbox_full", "Ящик переполнен"],
+  ["err_skip_letter", "Письмо временно не доставлено"],
+  ["err_spam_rejected", "Отклонено как спам (проблема отправителя)"],
+  ["err_spam_skipped", "Пропущено спам-фильтром (проблема отправителя)"],
+  ["err_spam_removed", "Удалено спам-фильтром после доставки (проблема отправителя)"],
+  ["err_blacklisted", "IP/домен отправителя в чёрном списке"],
+  ["err_destination_misconfigured", "Ошибка конфигурации сервера получателя"],
+  ["err_delivery_failed", "Доставка не удалась (причина не уточнена)"],
+  ["err_lost", "Письмо потеряно при отправке"],
+  ["err_internal", "Внутренняя ошибка отправителя"],
+  ["err_too_large", "Письмо слишком большое"],
+  ["ok_unsubscribed", "Получатель отписался"],
+  ["ok_fbl", "Жалоба на спам (Feedback Loop)"],
+  ["ok_spam_folder", "Попало в папку «Спам»"],
+];
+
+/**
+ * Возвращает читаемую причину на русском. Если категория не распознана —
+ * возвращаем её как есть (не теряем информацию, просто не переводим).
+ */
+export function categoryToRussianLabel(category: string): string {
+  const text = category.trim().toLowerCase();
+  if (!text) return "—";
+  for (const [key, label] of CATEGORY_LABELS_RU) {
+    if (text.includes(key)) return label;
+  }
+  return category;
 }
