@@ -68,6 +68,42 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--bord
 
 .muted { color: var(--muted); font-size: 13px; }
 .error { color: var(--danger); font-size: 14px; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 20px;
+}
+
+.modal-box {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 480px;
+  width: 100%;
+}
+
+.modal-box h4 {
+  margin-top: 0;
+  color: var(--danger);
+}
+
+.modal-box p {
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.modal-box .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
 .status-ok { color: var(--ok); }
 .status-processing { color: var(--accent); }
 .status-error { color: var(--danger); }

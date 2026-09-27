@@ -35,6 +35,7 @@ export default function HomePage() {
   const [checks, setChecks] = useState<CheckRow[]>([]);
   const [column, setColumn] = useState("email");
   const [senderDomain, setSenderDomain] = useState("");
+  const [knownDomains, setKnownDomains] = useState<string[]>([]);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState<{ stage: ProgressStage; done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,9 +50,20 @@ export default function HomePage() {
     setChecks((data as CheckRow[]) ?? []);
   }, []);
 
+  const loadKnownDomains = useCallback(async () => {
+    // Список доменов из уже загруженных bounce-отчётов — не критично, если
+    // не получится (например, ещё ни одного домена не импортировали), поэтому
+    // ошибку тут не показываем модалкой, только выключаем подсказки.
+    const { data } = await supabase.rpc("list_sender_domains");
+    if (data) setKnownDomains((data as { sender_domain: string }[]).map((r) => r.sender_domain));
+  }, []);
+
   useEffect(() => {
-    if (user) loadChecks();
-  }, [user, loadChecks]);
+    if (user) {
+      loadChecks();
+      loadKnownDomains();
+    }
+  }, [user, loadChecks, loadKnownDomains]);
 
   async function handleUpload() {
     const file = fileInputRef.current?.files?.[0];
@@ -100,6 +112,7 @@ export default function HomePage() {
     } catch (err: any) {
       const message = err.message ?? String(err);
       setError(message);
+      if (fileInputRef.current) fileInputRef.current.value = "";
       const { error: statusError } = await supabase
         .from("checks")
         .update({ status: "error", error_message: message })
@@ -130,6 +143,17 @@ export default function HomePage() {
 
   return (
     <div className="container">
+      {error && (
+        <div className="modal-overlay" onClick={() => setError(null)}>
+          <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+            <h4>Ошибка</h4>
+            <p>{error}</p>
+            <div className="modal-actions">
+              <button onClick={() => setError(null)}>Понятно</button>
+            </div>
+          </div>
+        </div>
+      )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <h1>Проверка email-списков</h1>
         <div style={{ display: "flex", gap: 8 }}>
@@ -139,41 +163,53 @@ export default function HomePage() {
         </div>
       </div>
 
-      <div className="card">
-        <h3>Новая проверка</h3>
-        <p className="muted">
-          Загрузите .xlsx или .csv со списком email. Обработка идёт прямо у вас в
-          браузере (синтаксис, опечатки, одноразовые сервисы) — сервер задействован
-          только для сверки с базой известных мёртвых адресов и проверки MX-записей
-          доменов. Никаких подключений к вашим почтовым серверам получателей не
-          выполняется.
-        </p>
-        <input
-          type="text"
-          value={column}
-          onChange={(e) => setColumn(e.target.value)}
-          placeholder="Название колонки с email (по умолчанию 'email')"
-          disabled={processing}
-        />
-        <input
-          type="text"
-          value={senderDomain}
-          onChange={(e) => setSenderDomain(e.target.value)}
-          placeholder="Для какого домена проверяем (например, course1.ru) — влияет на учёт отписок"
-          disabled={processing}
-        />
-        <input type="file" ref={fileInputRef} accept=".xlsx,.xls,.csv" disabled={processing} />
-        {error && <p className="error">{error}</p>}
-        {progress && (
+      {role !== "admin" && (
+        <div className="card">
+          <h3>Новая проверка</h3>
           <p className="muted">
-            {STAGE_LABELS[progress.stage]}
-            {progress.total > 0 && ` (${Math.min(progress.done, progress.total)}/${progress.total})`}
+            Загрузите .xlsx или .csv со списком email. Обработка идёт прямо у вас в
+            браузере (синтаксис, опечатки, одноразовые сервисы) — сервер задействован
+            только для сверки с базой известных мёртвых адресов и проверки MX-записей
+            доменов. Никаких подключений к вашим почтовым серверам получателей не
+            выполняется.
           </p>
-        )}
-        <button onClick={handleUpload} disabled={processing}>
-          {processing ? "Обработка..." : "Загрузить и проверить"}
-        </button>
-      </div>
+          <input
+            type="text"
+            value={column}
+            onChange={(e) => setColumn(e.target.value)}
+            placeholder="Название колонки с email (по умолчанию 'email')"
+            disabled={processing}
+            list="column-options"
+          />
+          <datalist id="column-options">
+            <option value="email" />
+            <option value="Email" />
+            <option value="E-mail" />
+            <option value="адрес почты" />
+          </datalist>
+          <input
+            type="text"
+            value={senderDomain}
+            onChange={(e) => setSenderDomain(e.target.value)}
+            placeholder="Для какого домена проверяем (например, course1.ru) — влияет на учёт отписок"
+            disabled={processing}
+            list="domain-options"
+          />
+          <datalist id="domain-options">
+            {knownDomains.map((d) => <option key={d} value={d} />)}
+          </datalist>
+          <input type="file" ref={fileInputRef} accept=".xlsx,.xls,.csv" disabled={processing} />
+          {progress && (
+            <p className="muted">
+              {STAGE_LABELS[progress.stage]}
+              {progress.total > 0 && ` (${Math.min(progress.done, progress.total)}/${progress.total})`}
+            </p>
+          )}
+          <button onClick={handleUpload} disabled={processing}>
+            {processing ? "Обработка..." : "Загрузить и проверить"}
+          </button>
+        </div>
+      )}
 
       <div className="card">
         <h3>Мои проверки</h3>
