@@ -225,7 +225,10 @@ Deno.serve(async (req: Request) => {
       if (upsertErr) throw new Error(`Ошибка записи в suppression-list: ${upsertErr.message}`);
     }
 
-    await admin.from("admin_audit_log").insert({
+    // Ошибку записи в аудит не глотаем молча (раньше из-за этого журнал
+    // оставался пустым, а импорт выглядел успешным): пишем в логи
+    // функции. Сам импорт к этому моменту уже выполнен, поэтому его не роняем.
+    const { error: auditErr } = await admin.from("admin_audit_log").insert({
       admin_id: adminUserId,
       action: "import_bounces",
       details: {
@@ -234,6 +237,7 @@ Deno.serve(async (req: Request) => {
         senderEmail: senderEmailNorm, senderDomain,
       },
     });
+    if (auditErr) console.error("admin_audit_log insert failed:", auditErr.message);
 
     // исходный отчёт можно удалить — он больше не нужен после импорта
     await admin.storage.from("uploads").remove([storagePath]);
