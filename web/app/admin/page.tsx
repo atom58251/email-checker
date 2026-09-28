@@ -115,10 +115,10 @@ function AuditTable({ entries, expanded, setExpanded }: { entries: Audit[]; expa
         <p className="muted">Отправитель: {String(d.senderEmail ?? "—")} · домен: {String(d.senderDomain ?? "—")}</p>
         <p className="muted">Из колонки: {String(d.resolvedFromColumn ?? "—")} · из текста: {String(d.resolvedFromText ?? "—")} · не распознано: {String(d.unresolved ?? "—")}</p>
         <p className="muted">Spam trap: {String(d.trapsFound ?? 0)} · дата не распознана: {String(d.dateFallbackCount ?? 0)} · проигнорировано: {String(d.ignoredCount ?? 0)}</p>
-        {d.senderIssueCounts && Object.keys(d.senderIssueCounts as object).length > 0 && (
+        {Boolean(d.senderIssueCounts) && Object.keys(d.senderIssueCounts as Record<string, number>).length > 0 && (
           <div className="stats-list">
             <span className="muted">Проблема отправителя:</span>
-            {Object.entries(d.senderIssueCounts as Record<string, number>).map(([key, value]) => <span key={key}>{key}: {value}</span>)}
+            {Object.entries(d.senderIssueCounts as Record<string, number>).map(([key, value]) => <span key={key}>{key}: {String(value)}</span>)}
           </div>
         )}
       </td></tr>}
