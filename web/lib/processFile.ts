@@ -88,12 +88,16 @@ export async function runCheck(
   // адресов, извлечённых из одной ячейки). Идём фиксированным диапазоном
   // originalRowCount, а не rows.length, чтобы не зациклиться на только
   // что добавленных строках.
-  const EMAIL_SPLIT_RE = /[,;\s]+/;
+  // Делим ячейку только если в ней найдено 2+ адресов (токены с "@"). Ячейки вида
+  // "Иван Иванов ivan@x.com" или "Иван <ivan@x.com>" (один адрес + текст) не трогаем:
+  // раньше они рвались по пробелам, и настоящий адрес уезжал в конец списка,
+  // а в исходной строке оставалось "Иван" со статусом INVALID_SYNTAX.
+  const EMAIL_TOKEN_RE = /[^\s,;<>()"'\[\]]+@[^\s,;<>()"'\[\]]+/g;
   const originalRowCount = rows.length;
   for (let i = 0; i < originalRowCount; i++) {
     const raw = rows[i][resolvedColumn];
     if (typeof raw !== "string") continue;
-    const parts = raw.split(EMAIL_SPLIT_RE).map((p) => p.trim()).filter(Boolean);
+    const parts: string[] = Array.from(raw.matchAll(EMAIL_TOKEN_RE), (m) => m[0]);
     if (parts.length <= 1) continue;
     rows[i] = { ...rows[i], [resolvedColumn]: parts[0] };
     for (let j = 1; j < parts.length; j++) {

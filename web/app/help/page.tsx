@@ -126,7 +126,7 @@ export default function HelpPage() {
         {isAdmin && <a href="#admin">Администрирование</a>}
         <a href="#security">Безопасность</a>
         <a href="#faq">Вопросы</a>
-        <a href="/">← На главную</a>
+        <a href={isAdmin ? "/admin" : "/"}>{isAdmin ? "← В админ-панель" : "← На главную"}</a>
       </div>
 
       <h2 id="overview">1. Что это за сервис</h2>
@@ -234,14 +234,17 @@ export default function HelpPage() {
 
           <h3>4.1 Импорт отчёта о недоставке</h3>
           <p>
-            На странице <code>/admin</code> — одна форма загрузки: колонка email (необязательно) и
-            сам файл (.csv или .xlsx). Правила обработки одни и те же для любого источника отчёта.
+            На странице <code>/admin</code> во вкладке «Импорт bounce» — форма загрузки: <strong>с какой
+            почты отправляли</strong> (обязательно, например <code>noreply@course1.ru</code> — по её домену
+            привязываются отписки), колонка email (необязательно) и сам файл (.csv или .xlsx). Правила
+            обработки одни и те же для любого источника отчёта, включая выгрузку Юнисендера.
           </p>
           <ul>
             <li>Адрес ищется в колонках <code>email</code>, <code>address</code>, <code>recipient</code>, <code>recipient_email</code>, либо своё имя вручную.</li>
             <li>Если отдельной колонки нет — адрес извлекается из текста ответа сервера (<code>smtp_response</code> или <code>last_response</code>), там где провайдер его публикует.</li>
             <li>Автоматическая защита от строки <code>sep=;</code> в начале файла (артефакт Excel).</li>
-            <li>Обязательна только колонка <code>category</code>.</li>
+            <li>Обязательна колонка со статусом: <code>category</code> или <code>Результат отправки</code> (Юнисендер). Дата события берётся из <code>sent_utc</code>, <code>added_utc</code> или <code>Время обновления</code>.</li>
+            <li>Отчёт после рассылки грузится именно сюда, а не в проверку списков: статусы уже получены от почтовых серверов, повторно проверять адреса не нужно.</li>
           </ul>
 
           <h3>4.2 Как классифицируются категории</h3>
@@ -275,6 +278,16 @@ export default function HelpPage() {
                   <td>Проблема на стороне вашей отправки (throttling, недоступность сервера, отказ по политике)</td>
                   <td>Не сохраняется вообще</td>
                 </tr>
+                <tr>
+                  <td><strong>COMPLAINT_UNSUBSCRIBE</strong></td>
+                  <td>Получатель отписался (<code>ok_unsubscribed</code>) или пожаловался на спам (<code>ok_fbl</code>, <code>ok_spam_folder</code>)</td>
+                  <td>В базу. Отписка действует только для домена отправителя из формы импорта, жалоба на спам — для всех проектов</td>
+                </tr>
+                <tr>
+                  <td><strong>IGNORE</strong></td>
+                  <td>Доставлено, открыто, клик по ссылке, дубль внутри рассылки, ещё не финальный статус</td>
+                  <td>Пропускается, считается отдельно в сводке</td>
+                </tr>
               </tbody>
             </table>
           </div>
@@ -284,7 +297,11 @@ export default function HelpPage() {
             domain_has_no_mail_server, broken mx record, Yandex account blocked by Yandex,
             disposable inbox service → PERMANENT_BLOCK; disposable_or_trap → TRAP; mailbox full /
             mailbox_full → RETRY_LATER; mail_server_unreachable, server_refuses_mail,
-            gmail_throttling → SENDER_ISSUE.
+            gmail_throttling → SENDER_ISSUE. Статусы Юнисендера: err_user_unknown, err_user_inactive,
+            err_mailbox_discarded, err_domain_inactive, err_unreachable → PERMANENT_BLOCK; err_mailbox_full,
+            err_skip_letter → RETRY_LATER; err_spam_rejected, err_spam_skipped, err_spam_removed,
+            err_blacklisted, err_destination_misconfigured, err_delivery_failed, err_lost, err_internal,
+            err_too_large → SENDER_ISSUE; ok_delivered, ok_read, ok_link_visited, skip_dup_* → IGNORE.
           </p>
           <div className="card">
             Категория, которой нет в списке, по умолчанию считается SENDER_ISSUE (пропускается) —
@@ -297,6 +314,8 @@ export default function HelpPage() {
             <li>Сколько адресов добавлено/обновлено, взято из колонки vs извлечено из текста ответа, сколько не распознано</li>
             <li>Сколько обнаружено spam trap (отдельное предупреждение)</li>
             <li>Сводка по пропущенным SENDER_ISSUE-категориям, с отдельным предупреждением при <code>gmail_throttling</code></li>
+            <li>Сколько строк проигнорировано (доставлено/открыто/дубли) и в скольких не распознана дата</li>
+            <li>Во вкладке «Аудит» — журнал импортов с деталями по каждому; во вкладке «Блоклисты» — колонки «Код» (первые 8 символов хэша адреса), «Причина (рус.)», отправитель и домен отправителя</li>
           </ul>
 
           <h3>4.4 Кэш подтверждённых мёртвых доменов</h3>

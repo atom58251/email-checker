@@ -55,12 +55,16 @@ Deno.serve(async (req: Request) => {
   }
   const senderEmailNorm = String(senderEmail ?? "").trim().toLowerCase();
   if (!senderEmailNorm || !senderEmailNorm.includes("@")) {
+    await admin.storage.from("uploads").remove([storagePath]).catch(() => {});
     return jsonResponse(
       { error: "senderEmail обязателен — с какой почты/домена был этот отчёт (нужно для правильной привязки отписок к проекту)" },
       { status: 400 }
     );
   }
   const senderDomain = senderEmailNorm.split("@")[1];
+
+  // Файл с открытыми email не должен оставаться в Storage ни при каком исходе.
+  const dropUpload = async () => { try { await admin.storage.from("uploads").remove([storagePath]); } catch (_) { /* не критично */ } };
 
   try {
     const { data: fileBlob, error: dlErr } = await admin.storage.from("uploads").download(storagePath);
@@ -173,7 +177,11 @@ Deno.serve(async (req: Request) => {
         // (COMPLAINT_UNSUBSCRIBE) привязывается к конкретному домену
         // отправителя: у админа 10 проектов на разных доменах, и отписка
         // от одного не должна блокировать рассылки с другого.
-        const entrySenderDomain = bucket === "COMPLAINT_UNSUBSCRIBE" ? senderDomain : "";
+        // Договорённость: по домену отправителя делится ТОЛЬКО отписка (ok_unsubscribed).
+        // Спам-жалоба (ok_fbl) и попадание в папку "Спам" бьют по репутации отправителя
+        // в целом — блокируем глобально, как и bounce-факты.
+        const isUnsubscribe = /unsubscrib/i.test(category);
+        const entrySenderDomain = bucket === "COMPLAINT_UNSUBSCRIBE" && isUnsubscribe ? senderDomain : "";
         upserts.push({
           email_hash: await hashEmail(emailNorm),
           domain,
@@ -254,6 +262,7 @@ Deno.serve(async (req: Request) => {
       ignoredCount,
     });
   } catch (e) {
+    await dropUpload();
     return jsonResponse({ error: String(e?.message ?? e) }, { status: 500 });
   }
 });

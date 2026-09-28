@@ -32,7 +32,7 @@ const STAGE_LABELS: Record<ProgressStage, string> = {
 
 export default function HomePage() {
   const { user, loading: userLoading } = useUser();
-  const { role } = useRole();
+  const { role, loading: roleLoading } = useRole();
   const router = useRouter();
   const [checks, setChecks] = useState<CheckRow[]>([]);
   const [column, setColumn] = useState("email");
@@ -147,7 +147,9 @@ export default function HomePage() {
     if (role === "admin") router.replace("/admin");
   }, [role, router]);
 
-  if (userLoading) return <div className="container">Загрузка...</div>;
+  // Пока роль неизвестна или идёт редирект админа — только "Загрузка...", без шапки:
+  // иначе кнопка "Админ-панель" на мгновение мелькала перед переходом.
+  if (userLoading || roleLoading || role !== "user") return <div className="container">Загрузка...</div>;
 
   return (
     <div className="container">
@@ -166,7 +168,6 @@ export default function HomePage() {
         <h1>Проверка email-списков</h1>
         <div style={{ display: "flex", gap: 8 }}>
           <a href="/help"><button className="secondary">Справка</button></a>
-          {role === "admin" && <a href="/admin"><button className="secondary">Админ-панель</button></a>}
           <button className="secondary" onClick={handleSignOut}>Выйти</button>
         </div>
       </div>

@@ -14,6 +14,33 @@ import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
+// Страховка: файлы в "uploads" (bounce-отчёты с открытыми email) должны удаляться
+// сразу после импорта. Если импорт не дошёл до удаления (обрыв сети, сбой), файл
+// остался бы навсегда — поэтому раз в запуск удаляем всё старше суток.
+async function sweepUploads(admin: ReturnType<typeof createClient>, maxAgeMs: number): Promise<number> {
+  const cutoff = Date.now() - maxAgeMs;
+  let removed = 0;
+  const { data: top } = await admin.storage.from("uploads").list("", { limit: 1000 });
+  for (const entry of top ?? []) {
+    if (entry.id) { // файл прямо в корне bucket
+      if (entry.created_at && Date.parse(entry.created_at) < cutoff) {
+        await admin.storage.from("uploads").remove([entry.name]);
+        removed++;
+      }
+      continue;
+    }
+    const { data: files } = await admin.storage.from("uploads").list(entry.name, { limit: 1000 });
+    const old = (files ?? [])
+      .filter((f) => f.id && f.created_at && Date.parse(f.created_at) < cutoff)
+      .map((f) => `${entry.name}/${f.name}`);
+    if (old.length) {
+      await admin.storage.from("uploads").remove(old);
+      removed += old.length;
+    }
+  }
+  return removed;
+}
+
 Deno.serve(async (req: Request) => {
   const authHeader = req.headers.get("Authorization") ?? "";
   if (authHeader !== `Bearer ${SERVICE_ROLE_KEY}`) {
@@ -46,8 +73,15 @@ Deno.serve(async (req: Request) => {
     .delete()
     .lt("expires_at", new Date().toISOString());
 
+  let sweptUploads = 0;
+  try {
+    sweptUploads = await sweepUploads(admin, 24 * 60 * 60 * 1000);
+  } catch (e) {
+    console.error("sweepUploads failed:", String((e as Error)?.message ?? e));
+  }
+
   return new Response(
-    JSON.stringify({ ok: !delErr, purgedChecks: expired?.length ?? 0, removedFiles, delErr: delErr?.message }),
+    JSON.stringify({ ok: !delErr, purgedChecks: expired?.length ?? 0, removedFiles, sweptUploads, delErr: delErr?.message }),
     { headers: { "Content-Type": "application/json" } },
   );
 });
