@@ -3,6 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import { useUser } from "@/lib/useUser";
 import { useRole } from "@/lib/useRole";
@@ -32,6 +33,7 @@ const STAGE_LABELS: Record<ProgressStage, string> = {
 export default function HomePage() {
   const { user, loading: userLoading } = useUser();
   const { role } = useRole();
+  const router = useRouter();
   const [checks, setChecks] = useState<CheckRow[]>([]);
   const [column, setColumn] = useState("email");
   const [senderDomain, setSenderDomain] = useState("");
@@ -139,6 +141,12 @@ export default function HomePage() {
     await supabase.auth.signOut();
   }
 
+  // Админ работает только через админ-панель (импорт bounce, блоклисты) —
+  // проверка списков и история проверок ему на этой странице не нужны.
+  useEffect(() => {
+    if (role === "admin") router.replace("/admin");
+  }, [role, router]);
+
   if (userLoading) return <div className="container">Загрузка...</div>;
 
   return (
@@ -163,7 +171,7 @@ export default function HomePage() {
         </div>
       </div>
 
-      {role !== "admin" && (
+      {role === "user" && (
         <div className="card">
           <h3>Новая проверка</h3>
           <p className="muted">
@@ -211,62 +219,64 @@ export default function HomePage() {
         </div>
       )}
 
-      <div className="card">
-        <h3>Мои проверки</h3>
-        {checks.length === 0 && <p className="muted">Пока нет ни одной проверки.</p>}
-        {checks.length > 0 && (
-          <table>
-            <thead>
-              <tr>
-                <th>Файл</th>
-                <th>Статус</th>
-                <th>Всего</th>
-                <th>Удалить / Проверить / Оставить</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {checks.map((c) => (
-                <tr key={c.id}>
-                  <td>{c.original_filename}</td>
-                  <td className={`status-${c.status === "done" ? "ok" : c.status === "error" ? "error" : "processing"}`}>
-                    {c.status === "pending" && "в очереди"}
-                    {c.status === "processing" && "обрабатывается..."}
-                    {c.status === "done" && "готово"}
-                    {c.status === "error" && `ошибка: ${c.error_message ?? ""}`}
-                  </td>
-                  <td>{c.total_rows ?? "—"}</td>
-                  <td className="muted">
-                    {c.stats
-                      ? (() => {
-                          const entries = Object.entries(c.stats);
-                          const toDelete = entries
-                            .filter(([k]) => DELETE_STATUSES.has(k))
-                            .reduce((s, [, v]) => s + v, 0);
-                          const toReview = entries
-                            .filter(([k]) => REVIEW_STATUSES.has(k))
-                            .reduce((s, [, v]) => s + v, 0);
-                          const toKeep = entries
-                            .filter(([k]) => !DELETE_STATUSES.has(k) && !REVIEW_STATUSES.has(k))
-                            .reduce((s, [, v]) => s + v, 0);
-                          return `удалить: ${toDelete} / проверить: ${toReview} / оставить: ${toKeep}`;
-                        })()
-                      : "—"}
-                  </td>
-                  <td>
-                    {c.status === "done" && c.result_storage_path && (
-                      <button className="secondary" onClick={() => handleDownload(c)}>Скачать</button>
-                    )}
-                  </td>
+      {role === "user" && (
+        <div className="card">
+          <h3>Мои проверки</h3>
+          {checks.length === 0 && <p className="muted">Пока нет ни одной проверки.</p>}
+          {checks.length > 0 && (
+            <table>
+              <thead>
+                <tr>
+                  <th>Файл</th>
+                  <th>Статус</th>
+                  <th>Всего</th>
+                  <th>Удалить / Проверить / Оставить</th>
+                  <th></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-        <p className="muted" style={{ marginTop: 12 }}>
-          Результаты и исходные файлы автоматически удаляются через 14 дней.
-        </p>
-      </div>
+              </thead>
+              <tbody>
+                {checks.map((c) => (
+                  <tr key={c.id}>
+                    <td>{c.original_filename}</td>
+                    <td className={`status-${c.status === "done" ? "ok" : c.status === "error" ? "error" : "processing"}`}>
+                      {c.status === "pending" && "в очереди"}
+                      {c.status === "processing" && "обрабатывается..."}
+                      {c.status === "done" && "готово"}
+                      {c.status === "error" && `ошибка: ${c.error_message ?? ""}`}
+                    </td>
+                    <td>{c.total_rows ?? "—"}</td>
+                    <td className="muted">
+                      {c.stats
+                        ? (() => {
+                            const entries = Object.entries(c.stats);
+                            const toDelete = entries
+                              .filter(([k]) => DELETE_STATUSES.has(k))
+                              .reduce((s, [, v]) => s + v, 0);
+                            const toReview = entries
+                              .filter(([k]) => REVIEW_STATUSES.has(k))
+                              .reduce((s, [, v]) => s + v, 0);
+                            const toKeep = entries
+                              .filter(([k]) => !DELETE_STATUSES.has(k) && !REVIEW_STATUSES.has(k))
+                              .reduce((s, [, v]) => s + v, 0);
+                            return `удалить: ${toDelete} / проверить: ${toReview} / оставить: ${toKeep}`;
+                          })()
+                        : "—"}
+                    </td>
+                    <td>
+                      {c.status === "done" && c.result_storage_path && (
+                        <button className="secondary" onClick={() => handleDownload(c)}>Скачать</button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <p className="muted" style={{ marginTop: 12 }}>
+            Результаты и исходные файлы автоматически удаляются через 1 день.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

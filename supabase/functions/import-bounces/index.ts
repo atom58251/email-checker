@@ -196,9 +196,29 @@ Deno.serve(async (req: Request) => {
     // конфликт теперь по паре, а не только по email_hash, чтобы глобальная
     // bounce-запись и запись об отписке от конкретного домена не затирали
     // друг друга).
+    // Один и тот же адрес может встретиться в отчёте несколько раз (отчёт
+    // Юнисендера построен по событиям: например, и отписка, и жалоба, или
+    // повторная недоставка). Если такие дубли попадут в один пакет upsert,
+    // Postgres откажет во всём пакете ("ON CONFLICT DO UPDATE command cannot
+    // affect row a second time"). Поэтому схлопываем по ключу конфликта
+    // (email_hash + sender_domain): trap-запись приоритетнее, иначе берём
+    // более свежую; last_seen — максимальный из двух.
+    const merged = new Map<string, (typeof upserts)[number]>();
+    for (const u of upserts) {
+      const key = `${u.email_hash}:${u.sender_domain}`;
+      const prev = merged.get(key);
+      if (!prev) { merged.set(key, u); continue; }
+      const pick =
+        u.is_trap && !prev.is_trap ? u :
+        prev.is_trap && !u.is_trap ? prev :
+        u.last_seen >= prev.last_seen ? u : prev;
+      merged.set(key, { ...pick, last_seen: u.last_seen >= prev.last_seen ? u.last_seen : prev.last_seen });
+    }
+    const uniqueUpserts = Array.from(merged.values());
+
     const CHUNK = 500;
-    for (let i = 0; i < upserts.length; i += CHUNK) {
-      const chunk = upserts.slice(i, i + CHUNK);
+    for (let i = 0; i < uniqueUpserts.length; i += CHUNK) {
+      const chunk = uniqueUpserts.slice(i, i + CHUNK);
       const { error: upsertErr } = await admin.rpc("upsert_suppression_batch", {
         entries: chunk,
       });
@@ -223,7 +243,7 @@ Deno.serve(async (req: Request) => {
       resolvedFromColumn,
       resolvedFromText,
       unresolved,
-      totalAddedOrUpdated: upserts.length,
+      totalAddedOrUpdated: uniqueUpserts.length,
       trapsFound,
       senderIssueCounts,
       dateFallbackCount,
